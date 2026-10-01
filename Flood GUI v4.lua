@@ -5,6 +5,7 @@
 --      TAS System: Tomato (Base by Voiz#5668)
 --      Reverse Engineering/Base GUI: Tomato
 --      UI Library: xHeptc (Kavo)
+--      Lobby Tools (Boosts/Voting/Auto-Join): rokfx (merged from FE2 Troll)
 -- ==============================================================================
 
 -- ==============================================================================
@@ -62,6 +63,7 @@ local VirtualUser = game:GetService("VirtualUser")
 local UserInputService = game:GetService("UserInputService")
 local TeleportService = game:GetService("TeleportService")
 local HttpService = game:GetService("HttpService")
+local CoreGui = game:GetService("CoreGui")
 
 local LocalPlayer = Players.LocalPlayer
 local Camera = Workspace.CurrentCamera
@@ -74,6 +76,10 @@ local NewMapVote = RemoteFolder:WaitForChild("NewMapVote")
 local UpdMapVote = RemoteFolder:WaitForChild("UpdMapVote")
 local AddedWaiting = RemoteFolder:WaitForChild("AddedWaiting")
 local AlertRemote = RemoteFolder:WaitForChild("Alert")
+local AddMapEventRemote = RemoteFolder:FindFirstChild("AddMapEvent")
+local BoostIntensity = RemoteFolder:FindFirstChild("BoostIntensity")
+local ReqTele = RemoteFolder:FindFirstChild("ReqTele")
+local RemoveWaiting = RemoteFolder:FindFirstChild("RemoveWaiting")
 
 local CONFIG = {
     UI_LIBRARY = "https://github.com/tomatotxt/Kavo-UI-Library/raw/refs/heads/main/source.lua",
@@ -85,6 +91,13 @@ local CONFIG = {
 
 local DIFFICULTY_RANKS = {
     ["None"] = 999, ["Easy"] = 1, ["Normal"] = 2, ["Hard"] = 3, ["Insane"] = 4, ["Crazy"] = 5, ["Crazy+"] = 6
+}
+
+local SAFE_ROOM_CFRAME = CFrame.new(-100.5, -222.95, -36.5)
+
+local PLACE_IDS = {
+    Pro = 1273079594,
+    Normal = 738339342
 }
 
 local COLORS = {
@@ -129,7 +142,19 @@ local State = {
     Noclip = false,
     AirJump = false,
     SwimEnabled = false,
-    TASSpeed = 1 -- 1 = normal, lower = faster, higher = slower
+    TASSpeed = 1, -- 1 = normal, lower = faster, higher = slower
+
+    -- Lobby tools
+    AutoBoost = false,
+    AutoEvent = false,
+    AutoVoting = false,
+    AutoFullVote = false,
+    CustomVoteTarget = 4,
+    AutoTeleport = false,
+    AutoReqTele = false,
+    TargetUsername = "",
+    TargetUserId = nil,
+    SelectedPlaceType = "Pro"
 }
 
 local PauseButtonGui = nil
@@ -1724,6 +1749,291 @@ if getgenv().hookmetamethod then
 end
 
 -- ==============================================================================
+-- [8B] LOBBY TOOLS (Boosts / Voting / Auto-Join) - merged from FE2 Troll (rokfx)
+-- ==============================================================================
+local Lobby = {}
+
+do
+    local function GetIsVotingEvent()
+        local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+        local gameGui = playerGui and playerGui:FindFirstChild("GameGui")
+        local waiting = gameGui and gameGui:FindFirstChild("Waiting")
+        local clWaiting = waiting and waiting:FindFirstChild("CL_Waiting")
+        return clWaiting and clWaiting:FindFirstChild("IsVoting")
+    end
+
+    local function GetDoMapVote()
+        return CLMAIN and CLMAIN:FindFirstChild("DoMapVote")
+    end
+
+    function Lobby.CalculateCoinCost(voteCount)
+        if voteCount <= 1 then return 0 end
+        local totalCost = 0
+        for voteIndex = 2, voteCount do
+            totalCost = totalCost + math.clamp((voteIndex - 1) * 10, 10, 50)
+        end
+        return totalCost
+    end
+
+    -- ---------------------------- Vote burst ---------------------------------
+    local fullVoteInProgress = false
+
+    local function CastInstantFullVote(targetMap, startingVoteIndex)
+        local doMapVote = GetDoMapVote()
+        if not targetMap or not doMapVote then return end
+        local maxAllowedVotes = State.CustomVoteTarget or 4
+        local currentVotes = startingVoteIndex or 1
+
+        for voteIndex = currentVotes, maxAllowedVotes - 1 do
+            local extraCost = math.clamp(voteIndex * 10, 10, 50)
+            doMapVote:Fire(targetMap.ID, extraCost)
+        end
+
+        local votesFired = maxAllowedVotes - currentVotes
+        Alert(string.format("Vote Burst: Fired %d Extra Votes on %s!", votesFired, targetMap.name or "Map"), "Success")
+    end
+
+    local function TriggerAutoFullVote(voteData)
+        if not State.AutoFullVote or not voteData or not voteData.pVotes then return end
+        if fullVoteInProgress then return end
+
+        local playerVote = voteData.pVotes[tostring(LocalPlayer.UserId)]
+        if not playerVote or not playerVote.mapID or not (playerVote.voteCount > 0) then return end
+
+        local currentVotes = playerVote.voteCount
+        if currentVotes >= (State.CustomVoteTarget or 4) then return end
+
+        local targetMap = nil
+        if voteData.mapData then
+            for _, map in ipairs(voteData.mapData) do
+                if map.ID == playerVote.mapID then
+                    targetMap = map
+                    break
+                end
+            end
+        end
+        if not targetMap then return end
+
+        fullVoteInProgress = true
+        CastInstantFullVote(targetMap, currentVotes)
+    end
+
+    TrackConnection(NewMapVote.OnClientEvent:Connect(function()
+        fullVoteInProgress = false
+    end))
+
+    TrackConnection(UpdMapVote.OnClientEvent:Connect(function(voteData)
+        if State.AutoFullVote then
+            TriggerAutoFullVote(voteData)
+        end
+    end))
+
+    -- ---------------------------- Secret room TP -----------------------------
+    function Lobby.TeleportToSecretRoom(character)
+        if not State.AutoTeleport then return end
+        local rootpart = character:WaitForChild("HumanoidRootPart", 10)
+        if rootpart then
+            task.wait(0.1)
+            rootpart.CFrame = SAFE_ROOM_CFRAME
+        end
+    end
+
+    TrackConnection(LocalPlayer.CharacterAdded:Connect(function(character)
+        Lobby.TeleportToSecretRoom(character)
+    end))
+
+    -- ------------------- Auto event / auto voting (lobby) --------------------
+    local eventTriggeredThisRound = false
+    local votingActiveThisRound = false
+    local cachedPlayersLabel = nil
+    local lastLabelSearch = 0
+
+    -- Cached + throttled so we don't do a recursive Workspace search every frame
+    local function GetPlayersLabel()
+        if cachedPlayersLabel and cachedPlayersLabel.Parent then
+            return cachedPlayersLabel
+        end
+        local now = os.clock()
+        if now - lastLabelSearch < 1 then return nil end
+        lastLabelSearch = now
+
+        local gameInfo = Workspace:FindFirstChild("GameInfo", true)
+        if gameInfo then
+            local label = gameInfo:FindFirstChild("players", true) or gameInfo:FindFirstChild("Players", true)
+            if label and label:IsA("TextLabel") then
+                cachedPlayersLabel = label
+                return label
+            end
+        end
+        return nil
+    end
+
+    local function RunAutoVoting()
+        local char = LocalPlayer.Character
+        local root = char and char:FindFirstChild("HumanoidRootPart")
+        local humanoid = char and char:FindFirstChildOfClass("Humanoid")
+        if not root or not char then return end
+
+        local savedCFrame = root.CFrame
+        local function RestorePosition()
+            char:PivotTo(savedCFrame)
+            root.AssemblyLinearVelocity = Vector3.zero
+            root.AssemblyAngularVelocity = Vector3.zero
+            if humanoid then
+                humanoid:ChangeState(Enum.HumanoidStateType.Freefall)
+                task.defer(function()
+                    humanoid:ChangeState(Enum.HumanoidStateType.Running)
+                end)
+            end
+        end
+
+        local teleportConn
+        local hasRestored = false
+        teleportConn = root:GetPropertyChangedSignal("CFrame"):Connect(function()
+            if not hasRestored then
+                hasRestored = true
+                if teleportConn then teleportConn:Disconnect() end
+                task.wait(0.05)
+                RestorePosition()
+            end
+        end)
+
+        if AddedWaiting then AddedWaiting:FireServer() end
+        if RemoveWaiting then RemoveWaiting:FireServer() end
+
+        task.delay(1.5, function()
+            if teleportConn then teleportConn:Disconnect() end
+            if not hasRestored then RestorePosition() end
+        end)
+
+        local isVotingEvent = GetIsVotingEvent()
+        if isVotingEvent then
+            isVotingEvent:Fire(true)
+        end
+    end
+
+    TrackConnection(RunService.Heartbeat:Connect(function()
+        local playersLabel = GetPlayersLabel()
+        if not playersLabel then return end
+
+        if playersLabel.Text == "Waiting for Players" then
+            if State.AutoEvent and not eventTriggeredThisRound then
+                eventTriggeredThisRound = true
+                if AddMapEventRemote then
+                    AddMapEventRemote:FireServer()
+                    AddMapEventRemote:FireServer()
+                end
+            end
+            if State.AutoVoting and not votingActiveThisRound then
+                votingActiveThisRound = true
+                task.spawn(RunAutoVoting)
+            end
+        else
+            eventTriggeredThisRound = false
+            fullVoteInProgress = false
+            if votingActiveThisRound then
+                votingActiveThisRound = false
+                if State.AutoVoting then
+                    local isVotingEvent = GetIsVotingEvent()
+                    if isVotingEvent then
+                        isVotingEvent:Fire(false)
+                    end
+                end
+            end
+        end
+    end))
+
+    -- ---------------------------- Auto boost ---------------------------------
+    function Lobby.FullBoost()
+        if not BoostIntensity then
+            Alert("BoostIntensity remote not found.", "Error")
+            return
+        end
+        for _ = 1, 4 do
+            task.spawn(function()
+                BoostIntensity:FireServer(5)
+            end)
+        end
+    end
+
+    function Lobby.DoubleMapEvent()
+        if not AddMapEventRemote then
+            Alert("AddMapEvent remote not found.", "Error")
+            return
+        end
+        AddMapEventRemote:FireServer()
+        AddMapEventRemote:FireServer()
+    end
+
+    TrackConnection(Multiplayer.ChildAdded:Connect(function(NewMap)
+        NewMap:GetPropertyChangedSignal("Name"):Wait()
+        if State.AutoBoost then
+            Lobby.FullBoost()
+        end
+    end))
+
+    -- ---------------------------- Auto-Join ----------------------------------
+    local function DismissTeleportPrompt()
+        pcall(function()
+            local robloxPromptGui = CoreGui:FindFirstChild("RobloxPromptGui")
+            local promptOverlay = robloxPromptGui and robloxPromptGui:FindFirstChild("promptOverlay")
+            local errorPrompt = promptOverlay and promptOverlay:FindFirstChild("ErrorPrompt")
+            if errorPrompt and errorPrompt.Visible then
+                local messageArea = errorPrompt:FindFirstChild("MessageArea")
+                local buttonContainer = messageArea and messageArea:FindFirstChild("ErrorButtonArea")
+                local okButton = buttonContainer and buttonContainer:FindFirstChildWhichIsA("GuiButton", true)
+                if okButton then
+                    for _, conn in pairs(getconnections(okButton.MouseButton1Click)) do
+                        conn:Fire()
+                    end
+                end
+            end
+        end)
+    end
+
+    function Lobby.UpdateTargetUserId(username)
+        if username == "" or username == nil then
+            State.TargetUsername = ""
+            State.TargetUserId = nil
+            Alert("Target player cleared.", "Warning")
+            return
+        end
+        State.TargetUsername = username
+        task.spawn(function()
+            local success, id = pcall(function()
+                return Players:GetUserIdFromNameAsync(username)
+            end)
+            if success and id then
+                State.TargetUserId = id
+                Alert("Target set: " .. username .. " (ID: " .. tostring(id) .. ")", "Success")
+            else
+                State.TargetUserId = nil
+                Alert("Could not find user: " .. username, "Error")
+            end
+        end)
+    end
+
+    -- Session token: a re-execute replaces this value, which ends the old loop
+    local lobbySession = {}
+    getgenv().FloodGUI_LobbySession = lobbySession
+
+    task.spawn(function()
+        while getgenv().FloodGUI_LobbySession == lobbySession do
+            if State.AutoReqTele and ReqTele and State.TargetUserId then
+                DismissTeleportPrompt()
+                local placeId = PLACE_IDS[State.SelectedPlaceType] or PLACE_IDS.Pro
+                pcall(function()
+                    ReqTele:FireServer(placeId, State.TargetUserId)
+                end)
+                task.wait(4)
+            else
+                task.wait(1)
+            end
+        end
+    end)
+end
+
+-- ==============================================================================
 -- [9] USER INTERFACE (KAVO)
 -- ==============================================================================
 local function InitializeUI()
@@ -1842,6 +2152,116 @@ local function InitializeUI()
         Alert("Difficulty Limiter " .. (state and "Enabled" or "Disabled"), "Info")
     end)
 
+    local lobbyTab = Window:NewTab("Lobby")
+    local boostSec = lobbyTab:NewSection("Boosts & Events")
+
+    boostSec:NewToggle("Auto Boost (20 Gems)", "Automatically sends full boosts at round start.", function(state)
+        State.AutoBoost = state
+        Alert("Auto Boost " .. (state and "Enabled" or "Disabled"), state and "Success" or "Error")
+    end)
+
+    boostSec:NewButton("Manual Full Boost (20 Gems)", "Sends one-time manual boost requests.", function()
+        Lobby.FullBoost()
+    end)
+
+    boostSec:NewToggle("Auto Double Map Event (15 Gems)", "Automatically adds two events during voting.", function(state)
+        State.AutoEvent = state
+        Alert("Auto Double Map Event " .. (state and "Enabled" or "Disabled"), state and "Success" or "Error")
+    end)
+
+    boostSec:NewButton("Manual Double Map Event (15 Gems)", "Instantly adds 2 events.", function()
+        Lobby.DoubleMapEvent()
+    end)
+
+    local tpSec = lobbyTab:NewSection("Teleports")
+
+    tpSec:NewToggle("Auto TP to Secret Room", "Teleports your character to the safe room on spawn.", function(state)
+        State.AutoTeleport = state
+        Alert("Auto TP to Secret Room " .. (state and "Enabled" or "Disabled"), state and "Success" or "Error")
+        if state and LocalPlayer.Character then
+            task.spawn(Lobby.TeleportToSecretRoom, LocalPlayer.Character)
+        end
+    end)
+
+    tpSec:NewButton("Manual TP to Secret Room", "Teleports to the safe area once.", function()
+        local char = GetChar()
+        local rootpart = char and char:FindFirstChild("HumanoidRootPart")
+        if rootpart then
+            rootpart.CFrame = SAFE_ROOM_CFRAME
+        end
+    end)
+
+    local automationTab = Window:NewTab("Automation")
+    local votingSec = automationTab:NewSection("Voting")
+
+    votingSec:NewToggle("Auto Open Voting", "Opens the voting screen remotely.", function(state)
+        State.AutoVoting = state
+        if state then
+            Alert("Auto Voting Enabled.", "Success")
+        else
+            Alert("Auto Voting Disabled.", "Info")
+            local playerGui = LocalPlayer:FindFirstChild("PlayerGui")
+            local gameGui = playerGui and playerGui:FindFirstChild("GameGui")
+            local waiting = gameGui and gameGui:FindFirstChild("Waiting")
+            local clWaiting = waiting and waiting:FindFirstChild("CL_Waiting")
+            local isVotingEvent = clWaiting and clWaiting:FindFirstChild("IsVoting")
+            if isVotingEvent then
+                isVotingEvent:Fire(false)
+            end
+        end
+    end)
+
+    local voteAutoSec = automationTab:NewSection("Vote Automator")
+    local CoinCostLabel = voteAutoSec:NewLabel("Estimated Coin Cost: " .. tostring(Lobby.CalculateCoinCost(State.CustomVoteTarget)) .. " Coins (" .. tostring(State.CustomVoteTarget) .. " votes)")
+
+    voteAutoSec:NewTextBox("Target Vote Amount", "Enter desired vote count", function(text)
+        local num = tonumber(text)
+        if num and num > 0 then
+            State.CustomVoteTarget = num
+            local cost = Lobby.CalculateCoinCost(num)
+            CoinCostLabel:UpdateLabel("Estimated Coin Cost: " .. tostring(cost) .. " Coins (" .. tostring(num) .. " votes)")
+            Alert("Vote amount set to: " .. tostring(num) .. " (Cost: " .. tostring(cost) .. " coins)", "Success")
+        else
+            State.CustomVoteTarget = 4
+            local cost = Lobby.CalculateCoinCost(4)
+            CoinCostLabel:UpdateLabel("Estimated Coin Cost: " .. tostring(cost) .. " Coins (4 votes)")
+            Alert("Invalid number. Reset vote target to 4.", "Warning")
+        end
+    end)
+
+    voteAutoSec:NewToggle("Custom Vote Amount", "Auto votes the target vote amount.", function(state)
+        State.AutoFullVote = state
+        if state then
+            Alert("Custom Vote Amount Enabled (" .. tostring(State.CustomVoteTarget) .. " votes).", "Success")
+        else
+            Alert("Custom Vote Amount Disabled.", "Info")
+        end
+    end)
+
+    local autoJoinSec = automationTab:NewSection("Auto-Join")
+
+    autoJoinSec:NewTextBox("Target Username", "Enter target player username and press Enter", function(text)
+        Lobby.UpdateTargetUserId(text)
+    end)
+
+    autoJoinSec:NewDropdown("Server Type", "Select Pro or Normal servers (Default = Pro)", {"Pro", "Normal"}, function(selected)
+        State.SelectedPlaceType = selected
+        Alert("Server type set to: " .. selected, "Info")
+    end)
+
+    autoJoinSec:NewToggle("Auto Teleport Request", "Fires a teleport request every four seconds.", function(state)
+        State.AutoReqTele = state
+        if state then
+            if State.TargetUserId then
+                Alert("Auto Teleport Request Enabled.", "Success")
+            else
+                Alert("Auto Teleport Request Enabled, but no target username is set!", "Warning")
+            end
+        else
+            Alert("Auto Teleport Request Disabled.", "Info")
+        end
+    end)
+
     local charTab = Window:NewTab("Local Player")
     local moveSec = charTab:NewSection("Movement Settings")
     
@@ -1892,6 +2312,7 @@ local function InitializeUI()
     credSec:NewLabel("Reverse Engineering/Base GUI: Tomato")
     credSec:NewLabel("UI Library: xHeptc (Kavo)")
     credSec:NewLabel("TAS Auto-Sync: wo0psie")
+    credSec:NewLabel("Lobby Tools: rokfx (github.com/4phi)")
     
     credSec:NewButton("Copy Support Server Invite", "Copies Discord invite.", function()
         if setclipboard then
@@ -1904,4 +2325,4 @@ local function InitializeUI()
 end
 
 InitializeUI()
-Alert("Flood GUI v4 (with Built-in TAS Player) Loaded Successfully!", "Success")
+Alert("Flood GUI v4 (TAS Player + Lobby Tools) Loaded Successfully!", "Success")
