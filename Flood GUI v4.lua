@@ -6,6 +6,9 @@
 --      Reverse Engineering/Base GUI: Tomato
 --      UI Library: xHeptc (Kavo)
 --      Lobby Tools (Boosts/Voting/Auto-Join): rokfx (merged from FE2 Troll)
+--      Config Save/Load, Auto-Rejoin Watchdog, TAS Library: added in merge
+--      Run Tracking, Discord Notifications, TAS Prefetch, Floating Button: added in merge
+--      Quick Farm (remote-based farm, Fast Load, God Mode): adapted from tomato.txt's quickfarm
 -- ==============================================================================
 
 -- ==============================================================================
@@ -27,6 +30,10 @@ if getgenv().FloodGUI_Connections or getgenv().TomatoConnections or getgenv().TA
         getgenv().TAS_RestoreAnim = nil
     end
     _G.LoopCancel = true
+    if getgenv().FloodGUI_FloatingBtn then
+        pcall(function() getgenv().FloodGUI_FloatingBtn:Destroy() end)
+        getgenv().FloodGUI_FloatingBtn = nil
+    end
     getgenv().TomatoAutoFarm = false
     getgenv().IsTASPlaying = false
     getgenv().TASPaused = false
@@ -37,6 +44,7 @@ getgenv().FloodGUI_Connections = {}
 getgenv().TomatoConnections = getgenv().FloodGUI_Connections
 getgenv().TASConnections = {}
 getgenv().TasFileCache = {}
+getgenv().TasDataCache = {}
 getgenv().TomatoAutoFarm = false
 getgenv().IsTASPlaying = false
 getgenv().TASPaused = false
@@ -80,6 +88,10 @@ local AddMapEventRemote = RemoteFolder:FindFirstChild("AddMapEvent")
 local BoostIntensity = RemoteFolder:FindFirstChild("BoostIntensity")
 local ReqTele = RemoteFolder:FindFirstChild("ReqTele")
 local RemoveWaiting = RemoteFolder:FindFirstChild("RemoveWaiting")
+local PressedMapButton = RemoteFolder:FindFirstChild("PressedMapButton") or RemoteFolder:WaitForChild("PressedMapButton")
+local UpdGoalLocator = RemoteFolder:FindFirstChild("UpdGoalLocator") or RemoteFolder:WaitForChild("UpdGoalLocator")
+local SurvivedRemote = RemoteFolder:FindFirstChild("Survived") or RemoteFolder:WaitForChild("Survived")
+local LoadedMapRemote = RemoteFolder:FindFirstChild("LoadedMap")
 
 local CONFIG = {
     UI_LIBRARY = "https://github.com/tomatotxt/Kavo-UI-Library/raw/refs/heads/main/source.lua",
@@ -154,10 +166,48 @@ local State = {
     AutoReqTele = false,
     TargetUsername = "",
     TargetUserId = nil,
-    SelectedPlaceType = "Pro"
+    SelectedPlaceType = "Pro",
+
+    -- Config / Safety
+    AutoRejoinDisconnect = false,
+    AutoRejoinStall = false,
+    StallMinutes = 8,
+    ReloadSource = "",
+    AutoSaveConfig = false,
+
+    -- Run tracking / notifications / mobile
+    MaxTasFails = 3,
+    WebhookURL = "",
+    WebhookEnabled = false,
+    FloatingButton = UserInputService.TouchEnabled and not UserInputService.KeyboardEnabled,
+
+    -- Quick farm
+    FastLoad = false,
+    GodMode = false,
+    PlayAfterButtons = false,
+    ResetAfterEscape = false,
+    StartDelay = 0,
+    ResetDelay = 0,
+    CycleChallenges = false,
+
+    -- Rejoin cooldown (FE2 blocks rejoining for ~10s after leaving/disconnecting)
+    RejoinDelay = 11,
+    RejoinPendingAt = 0
 }
 
 local PauseButtonGui = nil
+
+local RunStats = {
+    Maps = {}, SessionOk = 0, SessionFail = 0,
+    Escapes = 0, MapsSeen = 0, LastEscape = 0, StartedAt = os.clock()
+}
+local Notify = {}
+local TasPrefetch = {}
+local QF = {
+    Goal = nil, Button = nil, Next = nil, Passkey = nil,
+    ExitPhase = false, Escaped = false, DelayOverride = false, ResettingCharacter = false,
+    UpdTarget = nil, LockIndices = {}, OrigUpd = nil, OrigNewAlert = nil, NoclipConn = nil
+}
 
 -- ==============================================================================
 -- [4] UTILITIES & ALERT SYSTEM
@@ -169,10 +219,9 @@ pcall(function() CLMAINenv = getsenv(CLMAIN) end)
 local function Alert(Text, ColorType)
     local Output = tostring(Text)
     local SelectedColor = COLORS[ColorType] or COLORS.System
-    if CLMAINenv and CLMAINenv.newAlert then
-        pcall(function() 
-            CLMAINenv.newAlert(Output, SelectedColor, nil, nil) 
-        end)
+    local alertFn = QF.OrigNewAlert or (CLMAINenv and CLMAINenv.newAlert)
+    if alertFn then
+        pcall(function() alertFn(Output, SelectedColor, nil, nil) end)
     end
     print("[Flood GUI]: " .. Output)
 end
@@ -196,7 +245,7 @@ end
 
 local function CleanMapName(name)
     if not name then return "" end
-    return name:gsub("\160", " "):gsub("^%s*(.-)%s*$", "%1")
+    return (name:gsub("\160", " "):gsub("^%s*(.-)%s*$", "%1"))
 end
 
 local function GetChar()
@@ -223,7 +272,7 @@ local function Check(Flag)
     if Flag == "InLift" then
         return (hrp.Position.X < 50 and hrp.Position.Z > 70)
     elseif Flag == "InGame" then
-        return (hrp.Position.X > 50)
+        return QF.DelayOverride or (hrp.Position.X > 50)
     end
     return false
 end
@@ -244,6 +293,27 @@ local function CheckGithubForFile(rawName)
     
     getgenv().TasFileCache[mapName] = exists
     return exists
+end
+
+-- Downloads a TAS file's raw JSON, trying both repo branches. Returns the string or nil.
+local function FetchTasRaw(rawName)
+    local names = { rawName }
+    local cleaned = CleanMapName(rawName)
+    if cleaned ~= rawName then names[#names + 1] = cleaned end
+    for _, name in ipairs(names) do
+        local encoded = HttpService:UrlEncode(name)
+        local urls = {
+            "https://raw.githubusercontent.com/tomatotxt/Flood-GUI/refs/heads/testing/TAS%20FILES/" .. encoded .. ".json",
+            CONFIG.TAS_BASE_URL .. encoded .. ".json",
+        }
+        for _, url in ipairs(urls) do
+            local ok, body = pcall(function() return game:HttpGet(url) end)
+            if ok and type(body) == "string" and #body >= 50 and not body:find("404: Not Found", 1, true) then
+                return body
+            end
+        end
+    end
+    return nil
 end
 
 local function GetRandomPointInPart(Part)
@@ -479,9 +549,19 @@ local function StartBuiltInTASPlayer()
     local LiftCheckPos = Vector3.new(-25, -144, 139)
     local CleanedUp = false
     
+    local RunMapName, RunStartedAt, RunDied = nil, 0, false
+
     local function Cleanup(resetCharacter)
         if CleanedUp then return end
         CleanedUp = true
+        if RunMapName then
+            local info = {
+                map = RunMapName, startedAt = RunStartedAt,
+                died = RunDied, manual = getgenv().TAS_ManualStop == true
+            }
+            RunMapName = nil
+            task.spawn(RunStats.Finish, info)
+        end
         pcall(function()
             if getgenv()._TAS_RestoreZiplines then getgenv()._TAS_RestoreZiplines() end
         end)
@@ -518,6 +598,7 @@ local function StartBuiltInTASPlayer()
 
         if resetCharacter and LP.Character and LP.Character:FindFirstChild("Humanoid") then
             Log("You reset or died. Halting the run...", "Error")
+            QF.ResettingCharacter = true
             LP.Character.Humanoid.Health = 0
         end
     end
@@ -529,7 +610,7 @@ local function StartBuiltInTASPlayer()
     end
 
     if LP.Character and LP.Character:FindFirstChild("Humanoid") then
-        AddTASConnection(LP.Character.Humanoid.Died:Connect(function() Cleanup(false) end))
+        AddTASConnection(LP.Character.Humanoid.Died:Connect(function() RunDied = true Cleanup(false) end))
     end
     AddTASConnection(LP.CharacterRemoving:Connect(function() Cleanup(false) end))
 
@@ -576,6 +657,12 @@ local function StartBuiltInTASPlayer()
     local realMapName = Map:WaitForChild('Settings'):GetAttribute("MapName")
     local mapName = HttpService:UrlEncode(realMapName)
 
+    if RunStats.IsBenched(CleanMapName(realMapName)) then
+        Log("TAS for '" .. realMapName .. "' is benched after repeated failures. Skipping this map.", "Warning")
+        Cleanup(true)
+        return
+    end
+
     local success, path
     if isfolder("Flood-GUI") and isfolder("Flood-GUI/TAS FILES") then
         local TargetTASPath = "Flood-GUI/TAS FILES/" .. realMapName .. ".json"
@@ -583,9 +670,18 @@ local function StartBuiltInTASPlayer()
     end
 
     if not path then
+        local prefetched = getgenv().TasDataCache[CleanMapName(realMapName)]
+        if prefetched then path = prefetched; success = true end
+    end
+
+    if not path then
         success, path = pcall(function()
             return game:HttpGet("https://raw.githubusercontent.com/tomatotxt/Flood-GUI/refs/heads/testing/TAS%20FILES/".. mapName .. ".json")
         end)
+        if not success or #path < 50 then
+            local raw = FetchTasRaw(realMapName) -- also tries the other repo branch
+            if raw then success, path = true, raw end
+        end
     end
 
     if not success or #path < 50 then
@@ -604,6 +700,7 @@ local function StartBuiltInTASPlayer()
 
     local OriginalFrameCount = #TAS
     Log("Loaded run for " .. realMapName .. " (" .. OriginalFrameCount .. " frames).", "Info")
+    RunMapName, RunStartedAt = CleanMapName(realMapName), os.clock()
     repeat task.wait() until Map.Name == "Map" or CleanedUp
     if CleanedUp then return end
 
@@ -1372,120 +1469,450 @@ end
 -- ==============================================================================
 -- [6] AUTO FARM
 -- ==============================================================================
-local function StartAutoFarm(Map)
-    if State.CurrentlyFarming then return end
-    State.CurrentlyFarming = true
-    
-    local char = GetChar()
-    local hrp = char and char:FindFirstChild("HumanoidRootPart")
-    local humanoid = char and char:FindFirstChildOfClass("Humanoid")
-    if not hrp or not humanoid then 
-        State.CurrentlyFarming = false
-        return 
+-- Quick farm logic adapted from tomato.txt's "quickfarm" script (Flood-GUI repo).
+-- Presses buttons through the PressedMapButton remote and escapes through the
+-- Survived remote with the server passkey.
+local debug_getupvalue = (debug and debug.getupvalue) or getupvalue
+local debug_setupvalue = (debug and debug.setupvalue) or setupvalue
+
+-- Executors disagree on getupvalue: some return (name, value), others just the value
+local function GetUpvalueValue(fn, idx)
+    if not debug_getupvalue or type(fn) ~= "function" then return false, nil end
+    local res = table.pack(pcall(debug_getupvalue, fn, idx))
+    if not res[1] then return false, nil end
+    local returned = res.n - 1
+    if returned >= 2 then return true, res[3] end
+    if returned == 1 then return true, res[2] end
+    return false, nil
+end
+
+local function ResolveToInstance(val)
+    if typeof(val) == "Instance" then
+        return val
+    elseif type(val) == "table" then
+        for _, item in pairs(val) do
+            local resolved = ResolveToInstance(item)
+            if resolved then return resolved end
+        end
     end
-    
-    local Buttons = {}
-    for _, MapObject in pairs(Map:GetDescendants()) do
-        if isRandomString(MapObject.Name) and MapObject.ClassName == "Model" then
-            local Hitbox
-            for _, Candidate in pairs(MapObject:GetChildren()) do
-                if Candidate:IsA("BasePart") and tostring(Candidate.BrickColor) ~= "Medium stone grey" then
-                    Hitbox = Candidate
-                    break
+    return nil
+end
+
+QF.Session = {}
+getgenv().FloodGUI_QFSession = QF.Session
+getgenv().FloodGUI_FastLoad = false
+
+-- Hooks (installed once per game session; they read getgenv flags so re-running never stacks them)
+function QF.InstallHooks()
+    pcall(function()
+        if not CLMAINenv then return end
+        local env = getgenv()
+        local hookfn = hookfunction or replaceclosure
+
+        -- Detect the exit alert from the game's own UI, without our alerts triggering it
+        if CLMAINenv.newAlert then
+            env.FloodGUI_OrigNewAlert = env.FloodGUI_OrigNewAlert or CLMAINenv.newAlert
+            QF.OrigNewAlert = env.FloodGUI_OrigNewAlert
+            CLMAINenv.newAlert = function(Text, ...)
+                local textStr = tostring(Text):lower()
+                if QF.ExitPhase and (textStr:find("escape") or textStr:find("survive") or textStr:find("drown")) then
+                    QF.Escaped = true
                 end
+                return QF.OrigNewAlert(Text, ...)
             end
-            if Hitbox and isRandomString(Hitbox.Name) then
-                Hitbox.Name = "Hitbox"
-                table.insert(Buttons, MapObject)
+        end
+
+        -- Fast Load
+        if hookfn and CLMAINenv.updGameState and not env.FloodGUI_FastLoadHooked then
+            env.FloodGUI_FastLoadHooked = true
+            local origUpd
+            origUpd = hookfn(CLMAINenv.updGameState, function(newState, mapData, mapIndex)
+                if newState == "loading" and env.FloodGUI_FastLoad then
+                    if type(mapData) == "table" then
+                        mapData.assetCount = 1
+                    end
+                    local valid, loadingUI = GetUpvalueValue(origUpd, 16)
+                    if valid and typeof(loadingUI) == "Instance" and loadingUI:IsA("GuiObject") then
+                        loadingUI.Visible = false
+                    end
+                end
+                return origUpd(newState, mapData, mapIndex)
+            end)
+            env.FloodGUI_OrigUpdGameState = origUpd
+        end
+        QF.OrigUpd = env.FloodGUI_OrigUpdGameState
+
+        if hookfn and CLMAINenv.screenFade and not env.FloodGUI_ScreenFadeHooked then
+            env.FloodGUI_ScreenFadeHooked = true
+            local origFade
+            origFade = hookfn(CLMAINenv.screenFade, function(...)
+                if env.FloodGUI_FastLoad then
+                    local lighting = game:GetService("Lighting")
+                    local blur = lighting:FindFirstChild("Fade_Blur")
+                    if blur then blur.Enabled = false end
+                    local colorCorrection = lighting:FindFirstChild("Fade_ColorCorrection")
+                    if colorCorrection then colorCorrection.Enabled = false end
+                    return
+                end
+                return origFade(...)
+            end)
+        end
+    end)
+end
+
+-- Finds the boolean upvalues of updGameState (the local "already escaping" locks)
+function QF.CacheGameScriptState()
+    local candidates = {}
+    local env = CLMAINenv
+    if env and env.updGameState then candidates[#candidates + 1] = env.updGameState end
+    if QF.OrigUpd then candidates[#candidates + 1] = QF.OrigUpd end
+
+    for _, fn in ipairs(candidates) do
+        local indices = {}
+        for i = 1, 150 do
+            local valid, value = GetUpvalueValue(fn, i)
+            if valid and type(value) == "boolean" then
+                indices[#indices + 1] = i
             end
+        end
+        if #indices > 0 then
+            QF.UpdTarget, QF.LockIndices = fn, indices
+            return
         end
     end
+    QF.UpdTarget, QF.LockIndices = candidates[1], {}
+end
 
-    if State.AutoCollect then
-        local LostPage = Map:FindFirstChild("_LostPage", true)
-        local Rescue = Map:FindFirstChild("_Rescue", true)
-        local OriginalCFrame = hrp.CFrame
-        
-        if LostPage then
-            hrp.CFrame = LostPage.CFrame
-            task.wait(0.1)
-            hrp.CFrame = OriginalCFrame
-            Alert("Hidden Page Acquired.", "Item")
-        end
-        if Rescue then
-            hrp.CFrame = Rescue.Contact.CFrame
-            task.wait(0.1) 
-            hrp.CFrame = OriginalCFrame
-            Alert("Survivor Rescued.", "Item")
-        end
+function QF.SafeReset()
+    QF.ResettingCharacter = true -- lets a reset through even when God Mode is on
+    pcall(function()
+        local hum = GetChar():FindFirstChildOfClass("Humanoid")
+        if hum then hum.Health = 0 end
+    end)
+end
+
+function QF.SetNoclip(on)
+    if QF.NoclipConn then
+        QF.NoclipConn:Disconnect()
+        QF.NoclipConn = nil
     end
-
-    Noclip(true)
-
-    while RunService.Heartbeat:Wait() and Check("InGame") and (State.AutoFarm or State.AutoPlay) do
-        if not State.CurrentlyFarming then break end
-
-        local ExitRegion = Map:FindFirstChild("ExitRegion", true)
-        if not hrp then break end
-        
-        local FailedScan = true
-        
-        if not ExitRegion then
-            if Camera.CameraSubject ~= humanoid then
-                Camera.CameraSubject = humanoid
-            end
-
-            hrp.Anchored = true
-            for _, Button in pairs(Buttons) do
-                if not (State.AutoFarm or State.AutoPlay) then break end 
-
-                local ButtonHitbox = Button:FindFirstChild("Hitbox")
-                if ButtonHitbox then
-                    local TouchFound = Button:FindFirstChild("TouchInterest", true)
-                    local GuiFound = Button:FindFirstChildWhichIsA("BillboardGui", true)
-                    
-                    if TouchFound and GuiFound then
-                        FailedScan = false
-                        hrp.Anchored = false
-                        hrp.CFrame = CFrame.new(ButtonHitbox.Position - Vector3.new(math.random(), math.random(), math.random()))
-                        humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
-                        task.wait(0.05)
-                        humanoid:ChangeState(Enum.HumanoidStateType.Running)
-                        task.wait(0.05)
+    if on then
+        QF.NoclipConn = RunService.Stepped:Connect(function()
+            local char = LocalPlayer.Character
+            if char then
+                for _, part in ipairs(char:GetDescendants()) do
+                    if part:IsA("BasePart") and part.CanCollide then
+                        part.CanCollide = false
                     end
                 end
             end
-            if FailedScan then 
-                RunService.Heartbeat:Wait() 
-            end
-
-        elseif ExitRegion then
-            Noclip(false)
-            hrp.Anchored = false
-            
-            if Camera.CameraSubject ~= ExitRegion then
-                Camera.CameraSubject = ExitRegion
-            end
-
-            if not State.Escaped then
-                local TargetCFrame = GetRandomPointInPart(ExitRegion)
-                hrp.CFrame = TargetCFrame
-                hrp.Velocity = Vector3.zero
-                humanoid:ChangeState(Enum.HumanoidStateType.Jumping)
-            else
-                State.Escaped = false
-                Camera.CameraSubject = humanoid
-                humanoid:ChangeState(Enum.HumanoidStateType.Dead)
-                Alert("Escape Detected. Resetting...", "Success")
-                break
+        end)
+        TrackConnection(QF.NoclipConn)
+    else
+        local char = LocalPlayer.Character
+        if char then
+            for _, part in ipairs(char:GetDescendants()) do
+                if part:IsA("BasePart") then
+                    part.CanCollide = true
+                end
             end
         end
     end
-    
-    if Camera.CameraSubject ~= humanoid then
-        Camera.CameraSubject = humanoid
+end
+
+-- Nearest part of the current goal (the goal can be a table of parts)
+function QF.GetTargetPart()
+    local goal = QF.Goal
+    if not goal then return nil end
+
+    if type(goal) == "table" then
+        local closestPart, minDistance = nil, math.huge
+        local char = LocalPlayer.Character
+        local hrp = char and char:FindFirstChild("HumanoidRootPart")
+        if hrp then
+            for _, part in pairs(goal) do
+                local resolved = ResolveToInstance(part)
+                if resolved and resolved:IsA("BasePart") then
+                    local offset = hrp.Position - resolved.Position
+                    local dist = offset.X * offset.X + offset.Y * offset.Y + offset.Z * offset.Z
+                    if dist < minDistance then
+                        minDistance = dist
+                        closestPart = resolved
+                    end
+                end
+            end
+        end
+        return closestPart
     end
-    Noclip(State.Noclip)
+
+    local resolved = ResolveToInstance(goal)
+    if resolved and resolved:IsA("BasePart") then
+        return resolved
+    end
+    return nil
+end
+
+QF.InstallHooks()
+
+TrackConnection(UpdGoalLocator.OnClientEvent:Connect(function(p1, p2, p3, p4)
+    QF.Goal, QF.Button, QF.Next = p1, p2, p4
+end))
+
+TrackConnection(AlertRemote.OnClientEvent:Connect(function(msg)
+    if QF.ExitPhase and type(msg) == "string" then
+        local text = msg:lower()
+        if text:find("escaped") or text:find("survived") then
+            QF.Escaped = true
+        end
+    end
+end))
+
+TrackConnection(LocalPlayer.CharacterAdded:Connect(function()
+    QF.ResettingCharacter = false
+end))
+
+-- God Mode: keep health pinned at 1000 (reset paths set ResettingCharacter to bypass it)
+TrackConnection(RunService.Heartbeat:Connect(function()
+    if not State.GodMode or QF.ResettingCharacter or State.ResettingForDifficulty then return end
+    local char = LocalPlayer.Character
+    local hum = char and char:FindFirstChildOfClass("Humanoid")
+    if hum and hum.Health > 0 then
+        if hum.MaxHealth ~= 1000 then hum.MaxHealth = 1000 end
+        if hum.Health < 1000 then hum.Health = 1000 end
+    end
+end))
+
+task.spawn(function()
+    QF.Passkey = GetSessionKey()
+end)
+
+-- Tells the server the map has loaded (4x per second while the farm is running)
+task.spawn(function()
+    while getgenv().FloodGUI_QFSession == QF.Session do
+        task.wait(0.25)
+        if QF.Passkey and LoadedMapRemote and (State.CurrentlyFarming or (State.AutoFarm and not State.AutoPlay)) then
+            pcall(function()
+                if LoadedMapRemote:IsA("RemoteEvent") then
+                    LoadedMapRemote:FireServer(QF.Passkey)
+                end
+            end)
+        end
+    end
+end)
+
+-- Cycle daily challenges every 10 minutes (blind)
+task.spawn(function()
+    local lastCycle = 0
+    while getgenv().FloodGUI_QFSession == QF.Session do
+        task.wait(1)
+        if State.CycleChallenges and os.time() - lastCycle >= 600 then
+            lastCycle = os.time()
+            local cycleRemote = RemoteFolder:FindFirstChild("CycleNewChallenges")
+            if cycleRemote then
+                pcall(function()
+                    cycleRemote:FireServer()
+                    Alert("Daily challenges cycled.", "Success")
+                end)
+            else
+                Alert("CycleNewChallenges remote not found.", "Warning")
+            end
+        end
+    end
+end)
+
+local function StartAutoFarm(Map)
+    if State.CurrentlyFarming then return end
+    State.CurrentlyFarming = true
+    QF.Goal, QF.Button, QF.Next = nil, nil, nil
+    QF.Escaped = false
+    QF.ExitPhase = false
+
+    local function Active()
+        return (State.AutoFarm or State.AutoPlay) and not _G.LoopCancel
+    end
+
+    local alternate = false
+    local escapeTimer = nil
+
+    if not QF.Passkey then QF.Passkey = GetSessionKey() end
+    QF.CacheGameScriptState()
+
+    local char = GetChar()
+    local Humanoid = char:WaitForChild("Humanoid", 10)
+    local HRP = char:WaitForChild("HumanoidRootPart", 10)
+    if not Humanoid or not HRP then
+        State.CurrentlyFarming = false
+        return
+    end
+
+    if not Check("InGame") then
+        Alert("Waiting for the match to start...", "Warning")
+    end
+
+    -- Wait until deployed in-game and unanchored (bails out if the map or character goes away)
+    while (not Check("InGame") or HRP.Anchored) and Active() and Map.Parent and HRP.Parent do
+        task.wait()
+    end
+    if not (Active() and Map.Parent and HRP.Parent) then
+        State.CurrentlyFarming = false
+        return
+    end
+
+    -- Exact map spawn (position + rotation) and camera, used by "Play after Buttons" / reset
+    local spawnCFrame = HRP.CFrame
+    local spawnCamCFrame = Camera and Camera.CFrame
+
+    QF.SetNoclip(true)
+    Alert("Farming started! Navigating targets.", "Success")
+
+    if State.StartDelay > 0 then
+        HRP.CFrame = CFrame.new(-25, -144, 139)
+        HRP.Velocity = Vector3.zero
+        QF.DelayOverride = true
+        Alert("Delaying navigation for " .. tostring(State.StartDelay) .. " seconds...", "Warning")
+        local remaining = State.StartDelay
+        while remaining > 0 and Active() and not QF.Escaped and Map.Parent do
+            task.wait(0.1)
+            remaining = remaining - 0.1
+        end
+    end
+
+    while RunService.Heartbeat:Wait() and Check("InGame") and Active() and not QF.Escaped and Map.Parent and HRP.Parent do
+        if not State.CurrentlyFarming then break end
+
+        local Hum = HRP.Parent:FindFirstChildOfClass("Humanoid")
+        if not Hum then continue end
+
+        local activeButton = ResolveToInstance(QF.Button)
+        local activeNextButton = ResolveToInstance(QF.Next)
+
+        local isButtonToPress = false
+        if activeButton and activeButton:IsA("BasePart") then
+            local nameLower = activeButton.Name:lower()
+            if not nameLower:find("exit") and not nameLower:find("region") then
+                isButtonToPress = true
+            end
+        end
+
+        local isNextButtonToPress = false
+        if activeNextButton and activeNextButton:IsA("BasePart") then
+            local nameLower = activeNextButton.Name:lower()
+            if not nameLower:find("exit") and not nameLower:find("region") then
+                isNextButtonToPress = true
+            end
+        end
+
+        local targetPart = nil
+        if isButtonToPress and isNextButtonToPress then
+            alternate = not alternate
+            targetPart = alternate and activeButton or activeNextButton
+        elseif isButtonToPress then
+            targetPart = activeButton
+        elseif isNextButtonToPress then
+            targetPart = activeNextButton
+        else
+            targetPart = QF.GetTargetPart()
+        end
+
+        if targetPart then
+            HRP.Anchored = false
+            if Camera.CameraSubject ~= Hum then
+                Camera.CameraSubject = Hum
+            end
+            if QF.Escaped then break end
+
+            HRP.CFrame = CFrame.new(targetPart.Position)
+            HRP.Velocity = Vector3.zero
+
+            -- Drop the lobby-coordinates override once we've teleported to the first target
+            QF.DelayOverride = false
+
+            if isButtonToPress or isNextButtonToPress then
+                escapeTimer = nil
+                if isButtonToPress then
+                    PressedMapButton:FireServer(activeButton)
+                end
+                if isNextButtonToPress then
+                    PressedMapButton:FireServer(activeNextButton)
+                end
+                task.wait()
+            else
+                -- All buttons pressed
+                if State.PlayAfterButtons then
+                    Alert("All buttons pressed! Returning to spawn for manual play...", "Success")
+                    HRP.CFrame = spawnCFrame
+                    HRP.Velocity = Vector3.zero
+                    if Camera and spawnCamCFrame then
+                        Camera.CameraType = Enum.CameraType.Custom
+                        Camera.CameraSubject = Humanoid
+                        Camera.CFrame = spawnCamCFrame
+                    end
+                    break -- stop without firing the Survived remote
+                end
+
+                QF.ExitPhase = true
+                if not escapeTimer then
+                    escapeTimer = os.time()
+                elseif os.time() - escapeTimer > 10 then
+                    Alert("Escape phase exceeded 10 seconds! Force resetting character to prevent lock.", "Error")
+                    QF.SafeReset()
+                    break
+                end
+
+                -- Clear the game script's local "already escaping" locks, then report the escape
+                if QF.UpdTarget and debug_setupvalue then
+                    for _, idx in ipairs(QF.LockIndices) do
+                        pcall(debug_setupvalue, QF.UpdTarget, idx, false)
+                    end
+                end
+                if QF.Passkey then
+                    SurvivedRemote:FireServer(QF.Passkey, 100)
+                end
+                task.wait()
+            end
+        else
+            task.wait()
+        end
+    end
+
+    -- Physical collision back on (and restore your own noclip toggle if it was on)
+    QF.SetNoclip(false)
+    if State.Noclip then Noclip(true) end
+
+    -- Post-escape handling
+    if QF.Escaped then
+        if HRP and HRP.Parent then
+            if State.ResetAfterEscape then
+                if spawnCFrame then HRP.CFrame = spawnCFrame end
+                HRP.Velocity = Vector3.zero
+                Alert("Escaped successfully! Resetting soon...", "Success")
+            else
+                HRP.CFrame = CFrame.new(-25, -144, 139)
+                HRP.Velocity = Vector3.zero
+                Alert("Escaped successfully!", "Success")
+            end
+        end
+
+        if State.AutoRebirth then
+            if QF.Passkey then
+                pcall(function() ReqRebirth:FireServer(QF.Passkey) end)
+                Alert("Auto Rebirth request sent.", "Info")
+            else
+                Alert("Failed Auto Rebirth: passkey missing.", "Error")
+            end
+        end
+
+        if State.ResetAfterEscape then
+            task.wait(State.ResetDelay or 0)
+            QF.SafeReset()
+        end
+    elseif not State.PlayAfterButtons then
+        Alert("Map beat or terminated.", "Info")
+    end
+
+    Alert("Waiting in lobby for the next round...", "System")
+    QF.ExitPhase = false
+    QF.DelayOverride = false
     State.CurrentlyFarming = false
 end
 
@@ -1581,7 +2008,7 @@ TrackConnection(Multiplayer.ChildAdded:Connect(function(NewMap)
     local Settings = NewMap:WaitForChild("Settings", 10)
     local MapName = Settings and Settings:GetAttribute("MapName") or NewMap.Name
     local cleanName = CleanMapName(MapName)
-    local hasTasFile = CheckGithubForFile(cleanName)
+    local hasTasFile = CheckGithubForFile(cleanName) and not RunStats.IsBenched(cleanName)
 
     local success, result = pcall(function()
         local diffText = Workspace.Lobby.GameInfo.SurfaceGui.Frame.Difficulty.Difficulty.Text
@@ -1594,8 +2021,7 @@ TrackConnection(Multiplayer.ChildAdded:Connect(function(NewMap)
         Alert("Map is too hard ("..result.."). Resetting...", "Error")
         State.ResettingForDifficulty = true
         task.wait(1)
-        local h = GetChar():FindFirstChild("Humanoid")
-        if h then h.Health = 0 end
+        QF.SafeReset()
         return
     end
 
@@ -1719,6 +2145,7 @@ end))
 TrackConnection(Players.PlayerAdded:Connect(function(player)
     if State.AutoLeave and player ~= LocalPlayer then
         Alert(("Player '%s' joined. Auto-leaving as configured."):format(player.Name), "Warning")
+        getgenv().FloodGUI_IntentionalLeave = true
         task.wait(0.5)
         pcall(LocalPlayer.Kick, LocalPlayer, "Flood GUI: Auto-Leave triggered by player joining.")
     end
@@ -2034,12 +2461,646 @@ do
 end
 
 -- ==============================================================================
+-- [8C] CONFIG SAVE/LOAD, AUTO-REJOIN WATCHDOG & TAS LIBRARY
+-- ==============================================================================
+local CONFIG_FILE = "FloodGUI_Config.json"
+
+-- UI toggle name -> State key (used to keep toggle visuals in sync with loaded config)
+local TOGGLE_KEYS = {
+    ["Enable Auto-Play"] = "AutoPlay",
+    ["Fallback to Blatant Farm"] = "FallbackToFarm",
+    ["Enable Auto-Farm"] = "AutoFarm",
+    ["Auto Collect (Page-Escapee)"] = "AutoCollect",
+    ["Auto Rebirth"] = "AutoRebirth",
+    ["Enforce Difficulty Limiter"] = "EnforceDifficulty",
+    ["Auto-Leave"] = "AutoLeave",
+    ["Auto Boost (20 Gems)"] = "AutoBoost",
+    ["Auto Double Map Event (15 Gems)"] = "AutoEvent",
+    ["Auto TP to Secret Room"] = "AutoTeleport",
+    ["Auto Open Voting"] = "AutoVoting",
+    ["Custom Vote Amount"] = "AutoFullVote",
+    ["Auto Teleport Request"] = "AutoReqTele",
+    ["Auto-Rejoin on Disconnect"] = "AutoRejoinDisconnect",
+    ["Auto-Rejoin on Stall"] = "AutoRejoinStall",
+    ["Auto-Save Config"] = "AutoSaveConfig",
+    ["Send Webhook Notifications"] = "WebhookEnabled",
+    ["Floating UI Button"] = "FloatingButton",
+    ["Fast Load"] = "FastLoad",
+    ["Enable God Mode"] = "GodMode",
+    ["Play after Buttons (No Escape)"] = "PlayAfterButtons",
+    ["Reset after Escape"] = "ResetAfterEscape",
+    ["Cycle Challenges (10 Min Blind)"] = "CycleChallenges",
+}
+
+local PERSIST_KEYS = {
+    "AutoPlay", "FallbackToFarm", "AutoFarm", "AutoCollect", "AutoRebirth", "AutoLeave",
+    "EnforceDifficulty", "AutoBoost", "AutoEvent", "AutoVoting", "AutoFullVote",
+    "AutoTeleport", "AutoReqTele", "AutoRejoinDisconnect", "AutoRejoinStall", "AutoSaveConfig",
+    "Mode", "TargetDifficulty", "TargetMapName", "WalkSpeed", "JumpPower", "TASSpeed",
+    "CustomVoteTarget", "TargetUsername", "SelectedPlaceType", "StallMinutes", "ReloadSource",
+    "MaxTasFails", "WebhookURL", "WebhookEnabled", "FloatingButton",
+    "FastLoad", "GodMode", "PlayAfterButtons", "ResetAfterEscape", "StartDelay", "ResetDelay",
+    "CycleChallenges", "RejoinDelay", "RejoinPendingAt",
+}
+
+local Config = { Toggles = {}, UIToggleState = {} }
+local Safety = {}
+local TasLibrary = { Maps = {}, Set = {}, Loaded = false, CurrentMap = nil, OnMapChanged = nil }
+
+do
+    local lastSavedSignature = nil
+
+    local function HasFileApi()
+        return type(writefile) == "function" and type(readfile) == "function" and type(isfile) == "function"
+    end
+
+    local function ConfigSignature()
+        local parts = {}
+        for _, key in ipairs(PERSIST_KEYS) do
+            parts[#parts + 1] = key .. "=" .. tostring(State[key])
+        end
+        return table.concat(parts, "|")
+    end
+
+    function Config.Save(silent)
+        if not HasFileApi() then
+            if not silent then Alert("Your executor has no file API (writefile).", "Error") end
+            return false
+        end
+        local data = {}
+        for _, key in ipairs(PERSIST_KEYS) do
+            data[key] = State[key]
+        end
+        local ok, err = pcall(function()
+            writefile(CONFIG_FILE, HttpService:JSONEncode(data))
+        end)
+        if ok then
+            lastSavedSignature = ConfigSignature()
+            if not silent then Alert("Config saved to " .. CONFIG_FILE, "Success") end
+        elseif not silent then
+            Alert("Config save failed: " .. tostring(err), "Error")
+        end
+        return ok
+    end
+
+    function Config.Load(silent)
+        if not HasFileApi() then
+            if not silent then Alert("Your executor has no file API (readfile).", "Error") end
+            return false
+        end
+        local okExists, exists = pcall(isfile, CONFIG_FILE)
+        if not okExists or not exists then
+            if not silent then Alert("No saved config found.", "Warning") end
+            return false
+        end
+        local okRead, raw = pcall(readfile, CONFIG_FILE)
+        if not okRead or type(raw) ~= "string" then
+            if not silent then Alert("Could not read config file.", "Error") end
+            return false
+        end
+        local okDecode, data = pcall(function() return HttpService:JSONDecode(raw) end)
+        if not okDecode or type(data) ~= "table" then
+            Alert("Config file is corrupted. Save a new one to replace it.", "Error")
+            return false
+        end
+
+        for _, key in ipairs(PERSIST_KEYS) do
+            local value = data[key]
+            if value ~= nil and type(value) == type(State[key]) then
+                State[key] = value
+            end
+        end
+
+        -- Sanity checks so a hand-edited file can't break anything
+        if not (State.TASSpeed > 0) then State.TASSpeed = 1 end
+        State.WalkSpeed = math.clamp(State.WalkSpeed, 1, 100)
+        State.JumpPower = math.clamp(State.JumpPower, 0, 200)
+        if not (State.StallMinutes >= 1) then State.StallMinutes = 8 end
+        if not (State.MaxTasFails >= 0) then State.MaxTasFails = 3 end
+        if not (State.StartDelay >= 0) then State.StartDelay = 0 end
+        if not (State.ResetDelay >= 0) then State.ResetDelay = 0 end
+        if not (State.RejoinDelay >= 0) then State.RejoinDelay = 11 end
+        if not (State.CustomVoteTarget > 0) then State.CustomVoteTarget = 4 end
+        if State.Mode ~= "Farm" and State.Mode ~= "Play" and State.Mode ~= "Record" then State.Mode = "Farm" end
+        if DIFFICULTY_RANKS[State.TargetDifficulty] == nil then State.TargetDifficulty = "Normal" end
+        if State.SelectedPlaceType ~= "Pro" and State.SelectedPlaceType ~= "Normal" then State.SelectedPlaceType = "Pro" end
+
+        getgenv().TomatoAutoFarm = State.AutoFarm
+        getgenv().FloodGUI_FastLoad = State.FastLoad
+        if State.AutoPlay then getgenv().TAS_ManualStop = false end
+        if State.TargetUsername ~= "" then
+            Lobby.UpdateTargetUserId(State.TargetUsername)
+        end
+
+        lastSavedSignature = ConfigSignature()
+        Alert(string.format("Config loaded (WalkSpeed %s, JumpPower %s, TAS speed %s, start delay %s, reset delay %s).",
+            tostring(State.WalkSpeed), tostring(State.JumpPower), tostring(State.TASSpeed),
+            tostring(State.StartDelay), tostring(State.ResetDelay)), "Success")
+        return true
+    end
+
+    function Config.Delete()
+        if HasFileApi() and type(delfile) == "function" then
+            local ok, exists = pcall(isfile, CONFIG_FILE)
+            if ok and exists then
+                pcall(delfile, CONFIG_FILE)
+                Alert("Saved config deleted.", "Warning")
+                return
+            end
+        end
+        Alert("No saved config to delete.", "Warning")
+    end
+
+    -- Wraps NewToggle so we can (a) remember each toggle object and (b) track its visual state.
+    -- Best effort: if the UI library is shaped differently, this silently does nothing.
+    function Config.HookWindow(Window)
+        pcall(function()
+            local origNewTab = Window.NewTab
+            if type(origNewTab) ~= "function" then return end
+            Window.NewTab = function(self, ...)
+                local tab = origNewTab(self, ...)
+                if type(tab) == "table" and type(tab.NewSection) == "function" then
+                    local origNewSection = tab.NewSection
+                    tab.NewSection = function(selfTab, ...)
+                        local sec = origNewSection(selfTab, ...)
+                        if type(sec) == "table" and type(sec.NewToggle) == "function" then
+                            local origNewToggle = sec.NewToggle
+                            sec.NewToggle = function(selfSec, name, desc, callback)
+                                local key = TOGGLE_KEYS[name]
+                                local cb = callback
+                                if key and type(callback) == "function" then
+                                    cb = function(state)
+                                        Config.UIToggleState[key] = state
+                                        return callback(state)
+                                    end
+                                end
+                                local obj = origNewToggle(selfSec, name, desc, cb)
+                                Config.Toggles[name] = obj
+                                return obj
+                            end
+                        end
+                        return sec
+                    end
+                end
+                return tab
+            end
+        end)
+    end
+
+    function Config.SyncUI()
+        for name, key in pairs(TOGGLE_KEYS) do
+            local obj = Config.Toggles[name]
+            local want = State[key] == true
+            local have = Config.UIToggleState[key] == true
+            if obj and want ~= have and type(obj.UpdateToggle) == "function" then
+                pcall(obj.UpdateToggle, obj, name, want)
+                Config.UIToggleState[key] = want
+            end
+        end
+    end
+
+    -- Auto-save: only writes when something actually changed
+    local configSession = {}
+    getgenv().FloodGUI_ConfigSession = configSession
+    task.spawn(function()
+        while getgenv().FloodGUI_ConfigSession == configSession do
+            task.wait(15)
+            if State.AutoSaveConfig and ConfigSignature() ~= lastSavedSignature then
+                Config.Save(true)
+            end
+        end
+    end)
+end
+
+-- ----------------------------- Auto-Rejoin watchdog ---------------------------
+do
+    local GuiService = game:GetService("GuiService")
+    local rejoining = false
+    local queuedOnce = false
+    local attempts = 0
+    local lastProgress = os.clock()
+    getgenv().FloodGUI_IntentionalLeave = false
+
+    local function GetQueueFn()
+        local env = getgenv()
+        if type(env.queue_on_teleport) == "function" then return env.queue_on_teleport end
+        if type(queue_on_teleport) == "function" then return queue_on_teleport end
+        if type(env.syn) == "table" and type(env.syn.queue_on_teleport) == "function" then return env.syn.queue_on_teleport end
+        return nil
+    end
+
+    -- Re-runs this script after the teleport (workspace file name OR https link)
+    local function QueueReload()
+        if queuedOnce then return true end
+        local src = State.ReloadSource
+        local queueFn = GetQueueFn()
+        if type(src) ~= "string" or src == "" or src:find("]=]", 1, true) or not queueFn then
+            return false
+        end
+        local code
+        if src:match("^https?://") then
+            code = "loadstring(game:HttpGet([=[" .. src .. "]=]))()"
+        else
+            code = "if isfile([=[" .. src .. "]=]) then loadstring(readfile([=[" .. src .. "]=]))() end"
+        end
+        local ok = pcall(queueFn, code)
+        queuedOnce = ok
+        return ok
+    end
+
+    -- opts.delay: seconds to wait before teleporting. FE2 blocks rejoining for ~10s after
+    --             you leave or get kicked, so kick/disconnect rejoins wait it out first.
+    -- opts.stillWanted: optional function; return false to cancel while waiting.
+    function Safety.Rejoin(reason, opts)
+        if rejoining then return end
+        opts = opts or {}
+        rejoining = true
+        attempts = attempts + 1
+        local delay = opts.delay or 1
+        Alert("Rejoining (" .. tostring(reason) .. ") in " .. tostring(delay) .. "s...", "Warning")
+        Notify.Send("Rejoining (" .. tostring(reason) .. "), waiting " .. tostring(delay) .. "s")
+        task.spawn(function()
+            if not QueueReload() then
+                Alert("No Reload Source set (or queue_on_teleport unsupported): the script won't auto-run after rejoining.", "Warning")
+            end
+            task.wait(delay)
+            if opts.stillWanted and not opts.stillWanted() then
+                rejoining = false
+                Alert("Rejoin cancelled.", "Info")
+                return
+            end
+            -- Marks the new session as "just rejoined" so a kick on arrival is retried
+            State.RejoinPendingAt = os.time()
+            Config.Save(true)
+            local ok, err = pcall(TeleportService.Teleport, TeleportService, game.PlaceId, LocalPlayer)
+            if not ok then
+                Alert("Teleport error: " .. tostring(err), "Error")
+                rejoining = false
+            end
+        end)
+    end
+
+    TrackConnection(TeleportService.TeleportInitFailed:Connect(function(_, result)
+        if not rejoining then return end
+        if attempts >= 10 then
+            rejoining = false
+            Alert("Rejoin failed 10 times. Giving up.", "Error")
+            return
+        end
+        Alert("Rejoin failed (" .. tostring(result) .. "). Retrying...", "Error")
+        local retryDelay = math.max(State.RejoinDelay, math.min(5 * attempts, 30))
+        rejoining = false
+        Safety.Rejoin("retry", { delay = retryDelay })
+    end))
+
+    local function WasJustRejoined()
+        return State.RejoinPendingAt > 0 and os.time() - State.RejoinPendingAt < 180
+    end
+
+    -- Kicked / disconnected (the Roblox error prompt). Also covers FE2 kicking you for
+    -- rejoining too fast: wait out the cooldown, then rejoin again.
+    local function OnKicked(msg)
+        if type(msg) ~= "string" or msg == "" then return end
+        if getgenv().FloodGUI_IntentionalLeave then return end
+        local justRejoined = WasJustRejoined()
+        if not (State.AutoRejoinDisconnect or justRejoined) then return end
+        local reason = justRejoined and "kicked right after rejoining (anti-rejoin cooldown)" or ("disconnected: " .. msg)
+        Safety.Rejoin(reason, {
+            delay = State.RejoinDelay,
+            stillWanted = function() return justRejoined or State.AutoRejoinDisconnect end,
+        })
+    end
+
+    TrackConnection(GuiService.ErrorMessageChanged:Connect(OnKicked))
+
+    -- The kick can already be on screen by the time this script loads
+    task.delay(1.5, function()
+        local ok, msg = pcall(function() return GuiService:GetErrorMessage() end)
+        if ok then OnKicked(msg) end
+    end)
+
+    -- Stayed connected for a minute: the rejoin worked, clear the marker
+    task.delay(60, function()
+        if not rejoining and State.RejoinPendingAt > 0 then
+            State.RejoinPendingAt = 0
+            Config.Save(true)
+        end
+    end)
+
+    -- Progress = a new map spawned or you escaped
+    TrackConnection(Multiplayer.ChildAdded:Connect(function()
+        lastProgress = os.clock()
+    end))
+    TrackConnection(AlertRemote.OnClientEvent:Connect(function(msg)
+        if type(msg) == "string" and msg:lower():match("escaped") then
+            lastProgress = os.clock()
+        end
+    end))
+
+    local safetySession = {}
+    getgenv().FloodGUI_SafetySession = safetySession
+    task.spawn(function()
+        while getgenv().FloodGUI_SafetySession == safetySession do
+            task.wait(5)
+            local active = State.AutoPlay or State.AutoFarm
+            if not (State.AutoRejoinStall and active) then
+                lastProgress = os.clock() -- timer only runs while armed
+            else
+                local limit = math.max(1, State.StallMinutes) * 60
+                if os.clock() - lastProgress >= limit then
+                    Alert(string.format("No progress for %s min. Rejoining in 10s (turn Auto-Rejoin off to cancel).", tostring(State.StallMinutes)), "Warning")
+                    task.wait(10)
+                    if State.AutoRejoinStall and (State.AutoPlay or State.AutoFarm) and os.clock() - lastProgress >= limit then
+                        Safety.Rejoin("Stalled")
+                    else
+                        lastProgress = os.clock()
+                    end
+                end
+            end
+        end
+    end)
+end
+
+-- ------------------------------- TAS Library ----------------------------------
+do
+    function TasLibrary.Refresh()
+        local ok, body = pcall(function() return game:HttpGet(CONFIG.TAS_API_URL) end)
+        if not ok or type(body) ~= "string" then return false, "request failed" end
+        local okDecode, data = pcall(function() return HttpService:JSONDecode(body) end)
+        if not okDecode or type(data) ~= "table" then return false, "bad response" end
+        if data.message then return false, tostring(data.message) end -- e.g. GitHub rate limit
+
+        local maps, set = {}, {}
+        for _, entry in ipairs(data) do
+            if type(entry) == "table" and type(entry.name) == "string" then
+                local base = entry.name:match("^(.*)%.json$")
+                if base then
+                    local name = CleanMapName(base)
+                    maps[#maps + 1] = name
+                    set[name] = true
+                    getgenv().TasFileCache[name] = true -- speeds up the per-map check too
+                end
+            end
+        end
+        table.sort(maps, function(a, b) return a:lower() < b:lower() end)
+        TasLibrary.Maps, TasLibrary.Set, TasLibrary.Loaded = maps, set, true
+        return true, #maps
+    end
+
+    -- Tells you, every round, whether the current map has a TAS file
+    TrackConnection(Multiplayer.ChildAdded:Connect(function(NewMap)
+        local renamed = false
+        local conn = NewMap:GetPropertyChangedSignal("Name"):Connect(function() renamed = true end)
+        local t0 = os.clock()
+        while not renamed and os.clock() - t0 < 5 do task.wait(0.1) end
+        conn:Disconnect()
+
+        local Settings = NewMap:WaitForChild("Settings", 10)
+        local mapName = CleanMapName(Settings and Settings:GetAttribute("MapName") or NewMap.Name)
+        local has = TasLibrary.Set[mapName] == true or CheckGithubForFile(mapName) == true
+        local benched = has and RunStats.IsBenched(mapName)
+
+        TasLibrary.CurrentMap = mapName
+        if benched then
+            Alert("TAS benched (repeated failures): " .. mapName, "Warning")
+        else
+            Alert((has and "TAS available: " or "No TAS file for: ") .. mapName, has and "Success" or "Warning")
+        end
+        if TasLibrary.OnMapChanged then
+            pcall(TasLibrary.OnMapChanged, mapName, has, benched)
+        end
+    end))
+end
+
+-- ------------------------------ Run tracking ----------------------------------
+do
+    local STATS_FILE = "FloodGUI_RunStats.json"
+    local BENCH_SECONDS = 3600
+    local lastEscapeCounted = -100
+
+    local function HasFileApi()
+        return type(writefile) == "function" and type(readfile) == "function" and type(isfile) == "function"
+    end
+
+    local function GetRecord(name)
+        local rec = RunStats.Maps[name]
+        if not rec then
+            rec = { ok = 0, fail = 0, streak = 0, lastFail = 0, lastReason = "" }
+            RunStats.Maps[name] = rec
+        end
+        return rec
+    end
+
+    function RunStats.Save()
+        if not HasFileApi() then return end
+        pcall(function()
+            writefile(STATS_FILE, HttpService:JSONEncode({ Maps = RunStats.Maps }))
+        end)
+    end
+
+    function RunStats.Load()
+        if not HasFileApi() then return end
+        local okExists, exists = pcall(isfile, STATS_FILE)
+        if not okExists or not exists then return end
+        local okRead, raw = pcall(readfile, STATS_FILE)
+        if not okRead or type(raw) ~= "string" then return end
+        local okDecode, data = pcall(function() return HttpService:JSONDecode(raw) end)
+        if not okDecode or type(data) ~= "table" or type(data.Maps) ~= "table" then return end
+        for name, rec in pairs(data.Maps) do
+            if type(name) == "string" and type(rec) == "table" then
+                RunStats.Maps[name] = {
+                    ok = tonumber(rec.ok) or 0,
+                    fail = tonumber(rec.fail) or 0,
+                    streak = tonumber(rec.streak) or 0,
+                    lastFail = tonumber(rec.lastFail) or 0,
+                    lastReason = type(rec.lastReason) == "string" and rec.lastReason or "",
+                }
+            end
+        end
+    end
+
+    -- A map is "benched" after N failures in a row. After 60 min it gets one more try.
+    function RunStats.IsBenched(name)
+        local limit = State.MaxTasFails
+        if limit <= 0 then return false end
+        local rec = RunStats.Maps[name]
+        if not rec or rec.streak < limit then return false end
+        if os.time() - rec.lastFail >= BENCH_SECONDS then
+            rec.streak = limit - 1
+            return false
+        end
+        return true
+    end
+
+    -- Called when a TAS run ends. Waits a moment because the "escaped" alert can land
+    -- just after the TAS stops.
+    function RunStats.Finish(info)
+        task.wait(3)
+        local rec = GetRecord(info.map)
+        if RunStats.LastEscape >= info.startedAt then
+            rec.ok = rec.ok + 1
+            rec.streak = 0
+            RunStats.SessionOk = RunStats.SessionOk + 1
+        elseif info.manual then
+            return -- you stopped it yourself, so it doesn't count as a failure
+        else
+            rec.fail = rec.fail + 1
+            rec.streak = rec.streak + 1
+            rec.lastFail = os.time()
+            rec.lastReason = info.died and "died" or "no escape"
+            RunStats.SessionFail = RunStats.SessionFail + 1
+            Alert(string.format("TAS failed on %s (%s). Fail streak: %d", info.map, rec.lastReason, rec.streak), "Error")
+            Notify.Send(string.format("TAS failed on %s (%s), streak %d", info.map, rec.lastReason, rec.streak))
+            local limit = State.MaxTasFails
+            if limit > 0 and rec.streak >= limit then
+                Alert("TAS benched for 60 min: " .. info.map, "Warning")
+                Notify.Send("TAS benched for 60 min: " .. info.map)
+            end
+        end
+        RunStats.Save()
+    end
+
+    function RunStats.Reset()
+        RunStats.Maps = {}
+        RunStats.SessionOk, RunStats.SessionFail = 0, 0
+        RunStats.Save()
+        Alert("TAS run stats reset.", "Warning")
+    end
+
+    function RunStats.FailingSummary()
+        local list = {}
+        for name, rec in pairs(RunStats.Maps) do
+            if rec.fail > 0 then
+                list[#list + 1] = { name = name, rec = rec }
+            end
+        end
+        table.sort(list, function(a, b)
+            if a.rec.streak ~= b.rec.streak then return a.rec.streak > b.rec.streak end
+            return a.rec.fail > b.rec.fail
+        end)
+        return list
+    end
+
+    -- Session counters
+    TrackConnection(Multiplayer.ChildAdded:Connect(function()
+        RunStats.MapsSeen = RunStats.MapsSeen + 1
+    end))
+    TrackConnection(AlertRemote.OnClientEvent:Connect(function(msg)
+        if type(msg) == "string" and msg:lower():match("escaped") then
+            RunStats.LastEscape = os.clock()
+            if os.clock() - lastEscapeCounted > 5 then
+                lastEscapeCounted = os.clock()
+                RunStats.Escapes = RunStats.Escapes + 1
+            end
+        end
+    end))
+end
+
+-- ------------------------------ Notifications ---------------------------------
+do
+    local lastSend = 0
+
+    local function GetRequestFn()
+        local env = getgenv()
+        if type(env.request) == "function" then return env.request end
+        if type(env.http_request) == "function" then return env.http_request end
+        if type(request) == "function" then return request end
+        if type(http_request) == "function" then return http_request end
+        if type(env.syn) == "table" and type(env.syn.request) == "function" then return env.syn.request end
+        return nil
+    end
+
+    -- Only Discord webhook URLs are accepted
+    function Notify.IsValidUrl(url)
+        if type(url) ~= "string" then return false end
+        return url:match("^https://[%w%.]*discord%.com/api/webhooks/%d+/[%w%-_]+$") ~= nil
+            or url:match("^https://[%w%.]*discordapp%.com/api/webhooks/%d+/[%w%-_]+$") ~= nil
+    end
+
+    -- Returns true if the message was queued
+    function Notify.Send(text, force)
+        if not force and not State.WebhookEnabled then return false end
+        if not Notify.IsValidUrl(State.WebhookURL) then return false end
+        local requestFn = GetRequestFn()
+        if not requestFn then return false end
+        local url = State.WebhookURL
+        local body = HttpService:JSONEncode({
+            username = "Flood GUI",
+            content = string.sub("**" .. LocalPlayer.Name .. "**: " .. tostring(text), 1, 1800),
+            allowed_mentions = { parse = {} },
+        })
+        task.spawn(function()
+            local gap = 2 - (os.clock() - lastSend)
+            if gap > 0 then task.wait(gap) end
+            lastSend = os.clock()
+            pcall(requestFn, {
+                Url = url,
+                Method = "POST",
+                Headers = { ["Content-Type"] = "application/json" },
+                Body = body,
+            })
+        end)
+        return true
+    end
+end
+
+-- ------------------------------ TAS prefetch ----------------------------------
+-- While the vote screen is up, download the TAS files of the candidate maps so the
+-- run can start the instant the map loads.
+do
+    local order = {}
+    local tried = {}
+    local MAX_CACHED = 12
+
+    local function Store(name, raw)
+        local cache = getgenv().TasDataCache
+        if cache[name] == nil then order[#order + 1] = name end
+        cache[name] = raw
+        while #order > MAX_CACHED do
+            cache[table.remove(order, 1)] = nil
+        end
+    end
+
+    function TasPrefetch.Map(rawName)
+        local name = CleanMapName(rawName)
+        if tried[name] or getgenv().TasDataCache[name] then return end
+        if getgenv().TasFileCache[name] == false then return end -- known to have no TAS
+        tried[name] = true
+        task.spawn(function()
+            local raw = FetchTasRaw(name)
+            if raw then Store(name, raw) end
+        end)
+    end
+
+    function TasPrefetch.FromVoteData(data)
+        if not State.AutoPlay or type(data) ~= "table" or type(data.mapData) ~= "table" then return end
+        local count = 0
+        for _, map in ipairs(data.mapData) do
+            if type(map) == "table" and type(map.name) == "string" then
+                TasPrefetch.Map(map.name)
+                count = count + 1
+                if count >= 8 then break end
+            end
+        end
+    end
+
+    TrackConnection(NewMapVote.OnClientEvent:Connect(TasPrefetch.FromVoteData))
+    TrackConnection(UpdMapVote.OnClientEvent:Connect(TasPrefetch.FromVoteData))
+end
+
+RunStats.Load()
+
+-- Restore saved settings before the UI is built
+Config.Load(true)
+
+-- ==============================================================================
 -- [9] USER INTERFACE (KAVO)
 -- ==============================================================================
 local function InitializeUI()
     local source = game:HttpGet(CONFIG.UI_LIBRARY)
     local Kavo = loadstring(source)()
     local Window = Kavo.CreateLib("Flood GUI v4", KAVO_THEME)
+    Config.HookWindow(Window)
     
     local tasTab = Window:NewTab("TAS")
     
@@ -2123,10 +3184,72 @@ local function InitializeUI()
         Alert("Infinite Yield Loaded.", "Info")
     end)
 
+    local tasLibSec = tasTab:NewSection("TAS Library")
+    local tasCountLabel = tasLibSec:NewLabel("TAS files: not loaded yet")
+    local tasMapLabel = tasLibSec:NewLabel("Current map: waiting for a round...")
+    local tasMapDropdown = tasLibSec:NewDropdown("Available TAS Maps", "Pick a map to set it as the snipe target.", {"(press Refresh)"}, function(current)
+        if type(current) == "string" and current:sub(1, 1) ~= "(" then
+            State.TargetMapName = current
+            Alert("Target map set to: " .. current, "System")
+        end
+    end)
+
+    local function RefreshTasLibrary()
+        local ok, result = TasLibrary.Refresh()
+        if ok then
+            pcall(function() tasCountLabel:UpdateLabel("TAS files: " .. tostring(result) .. " maps") end)
+            pcall(function() tasMapDropdown:Refresh(TasLibrary.Maps) end)
+            Alert("TAS library loaded: " .. tostring(result) .. " maps.", "Success")
+        else
+            pcall(function() tasCountLabel:UpdateLabel("TAS files: load failed") end)
+            Alert("TAS list failed: " .. tostring(result), "Error")
+        end
+    end
+
+    tasLibSec:NewButton("Refresh TAS List", "Fetches the available TAS files from GitHub.", function()
+        task.spawn(RefreshTasLibrary)
+    end)
+
+    TasLibrary.OnMapChanged = function(mapName, has, benched)
+        pcall(function()
+            tasMapLabel:UpdateLabel("Current map: " .. mapName .. " | TAS: " .. (benched and "BENCHED" or (has and "YES" or "NO")))
+        end)
+    end
+
+    task.spawn(RefreshTasLibrary)
+
+    local runSec = tasTab:NewSection("Run Tracking")
+
+    runSec:NewTextBox("Skip TAS After N Fails", "In a row, per map. 0 = never skip. Default 3. Retried after 60 min.", function(txt)
+        local num = tonumber(txt)
+        if num and num >= 0 then
+            State.MaxTasFails = math.floor(num)
+            Alert(State.MaxTasFails == 0 and "TAS skipping disabled." or ("TAS skipped after " .. State.MaxTasFails .. " fails in a row."), "Info")
+        else
+            Alert("Enter 0 or a positive whole number.", "Error")
+        end
+    end)
+
+    runSec:NewButton("Show Failing Maps", "Lists maps whose TAS has failed.", function()
+        local list = RunStats.FailingSummary()
+        if #list == 0 then
+            Alert("No TAS failures recorded.", "Success")
+            return
+        end
+        for i = 1, math.min(#list, 5) do
+            local item = list[i]
+            Alert(string.format("%s: %d fails / %d ok (streak %d, last: %s)", item.name, item.rec.fail, item.rec.ok, item.rec.streak, item.rec.lastReason), "Warning")
+        end
+    end)
+
+    runSec:NewButton("Reset Run Stats", "Clears all recorded TAS successes and failures.", function()
+        RunStats.Reset()
+    end)
+
     local autoTab = Window:NewTab("Auto Farm")
     local mainSec = autoTab:NewSection("Blatant Auto Farm Options")
     
-    mainSec:NewToggle("Enable Auto-Farm", "Instantly teleports to hitboxes to win.", function(state)
+    mainSec:NewToggle("Enable Auto-Farm", "Quick farm: presses buttons through remotes and escapes instantly.", function(state)
         State.AutoFarm = state
         getgenv().TomatoAutoFarm = state
         Alert("Blatant Auto Farm " .. (state and "Enabled" or "Disabled"), state and "Success" or "Error")
@@ -2150,6 +3273,42 @@ local function InitializeUI()
     mainSec:NewToggle("Enforce Difficulty Limiter", "Suicides to skip if map is too hard.", function(state)
         State.EnforceDifficulty = state
         Alert("Difficulty Limiter " .. (state and "Enabled" or "Disabled"), "Info")
+    end)
+
+    local qfSec = autoTab:NewSection("Quick Farm Options")
+
+    qfSec:NewToggle("Fast Load", "Skips the map loading delay and screens.", function(state)
+        State.FastLoad = state
+        getgenv().FloodGUI_FastLoad = state
+        Alert("Fast Load " .. (state and "Enabled" or "Disabled"), state and "Success" or "Error")
+    end)
+
+    qfSec:NewToggle("Enable God Mode", "Keeps your health at 1000.", function(state)
+        State.GodMode = state
+        Alert("God Mode " .. (state and "Enabled" or "Disabled"), state and "Success" or "Error")
+    end)
+
+    qfSec:NewToggle("Play after Buttons (No Escape)", "Presses every button, then returns you to spawn without escaping.", function(state)
+        State.PlayAfterButtons = state
+        Alert("Play after Buttons " .. (state and "Enabled" or "Disabled"), state and "Success" or "Error")
+    end)
+
+    qfSec:NewToggle("Reset after Escape", "Resets your character after escaping.", function(state)
+        State.ResetAfterEscape = state
+        Alert("Reset after Escape " .. (state and "Enabled" or "Disabled"), state and "Success" or "Error")
+    end)
+
+    qfSec:NewSlider("Autofarm Start Delay", "Seconds to wait after the map loads.", 30, 0, function(value)
+        State.StartDelay = value
+    end)
+
+    qfSec:NewSlider("Reset Delay", "Seconds to wait before resetting after an escape.", 10, 0, function(value)
+        State.ResetDelay = value
+    end)
+
+    qfSec:NewToggle("Cycle Challenges (10 Min Blind)", "Cycles your daily challenges every 10 minutes.", function(state)
+        State.CycleChallenges = state
+        Alert("Cycle Challenges " .. (state and "Enabled" or "Disabled"), state and "Success" or "Error")
     end)
 
     local lobbyTab = Window:NewTab("Lobby")
@@ -2296,6 +3455,90 @@ local function InitializeUI()
         Alert("UI " .. (State.UIEnabled and "Enabled" or "Disabled"), "Info")
     end)
 
+    -- Floating button: tap to hide/show the menu, drag to move it (handy on mobile)
+    local floatConns = {}
+
+    local function DestroyFloatingButton()
+        for _, c in ipairs(floatConns) do
+            pcall(function() c:Disconnect() end)
+        end
+        floatConns = {}
+        if getgenv().FloodGUI_FloatingBtn then
+            pcall(function() getgenv().FloodGUI_FloatingBtn:Destroy() end)
+            getgenv().FloodGUI_FloatingBtn = nil
+        end
+    end
+
+    local function CreateFloatingButton()
+        DestroyFloatingButton()
+
+        local gui = Instance.new("ScreenGui")
+        gui.Name = "FloodGUI_FloatingButton"
+        gui.ResetOnSpawn = false
+        gui.DisplayOrder = 999
+        gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+
+        local btn = Instance.new("TextButton")
+        btn.Name = "Toggle"
+        btn.Size = UDim2.new(0, 46, 0, 46)
+        btn.Position = UDim2.new(0, 12, 0.5, -23)
+        btn.BackgroundColor3 = Color3.fromRGB(8, 8, 8)
+        btn.BackgroundTransparency = 0.15
+        btn.Text = "F"
+        btn.TextColor3 = Color3.fromRGB(245, 245, 245)
+        btn.Font = Enum.Font.GothamBold
+        btn.TextSize = 20
+        btn.AutoButtonColor = true
+        btn.Parent = gui
+        Instance.new("UICorner", btn).CornerRadius = UDim.new(1, 0)
+        local stroke = Instance.new("UIStroke")
+        stroke.Color = Color3.fromRGB(180, 20, 30)
+        stroke.Thickness = 2
+        stroke.Parent = btn
+
+        local dragging, moved = false, false
+        local dragStart, startPos = nil, nil
+
+        btn.InputBegan:Connect(function(input)
+            if input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1 then
+                dragging, moved = true, false
+                dragStart, startPos = input.Position, btn.Position
+            end
+        end)
+
+        floatConns[#floatConns + 1] = TrackConnection(UserInputService.InputChanged:Connect(function(input)
+            if dragging and (input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseMovement) then
+                local delta = input.Position - dragStart
+                if delta.Magnitude > 8 then moved = true end
+                if moved then
+                    btn.Position = UDim2.new(startPos.X.Scale, startPos.X.Offset + delta.X, startPos.Y.Scale, startPos.Y.Offset + delta.Y)
+                end
+            end
+        end))
+
+        floatConns[#floatConns + 1] = TrackConnection(UserInputService.InputEnded:Connect(function(input)
+            if dragging and (input.UserInputType == Enum.UserInputType.Touch or input.UserInputType == Enum.UserInputType.MouseButton1) then
+                dragging = false
+                if not moved then
+                    State.UIEnabled = not State.UIEnabled
+                    pcall(function() Kavo:ToggleUI() end)
+                end
+            end
+        end))
+
+        local parent = (type(gethui) == "function" and gethui()) or CoreGui
+        local ok = pcall(function() gui.Parent = parent end)
+        if not ok or not gui.Parent then
+            pcall(function() gui.Parent = LocalPlayer:WaitForChild("PlayerGui") end)
+        end
+        getgenv().FloodGUI_FloatingBtn = gui
+    end
+
+    utilSec:NewToggle("Floating UI Button", "Shows a draggable button that hides/shows this menu.", function(state)
+        State.FloatingButton = state
+        if state then CreateFloatingButton() else DestroyFloatingButton() end
+    end)
+
     utilSec:NewToggle("Auto-Leave", "Automatically leaves if another player joins.", function(state)
         State.AutoLeave = state
         Alert("Auto-Leave " .. (state and "Enabled" or "Disabled"), "Info")
@@ -2306,6 +3549,122 @@ local function InitializeUI()
         pcall(TeleportService.Teleport, TeleportService, game.PlaceId, LocalPlayer)
     end)
 
+    local cfgTab = Window:NewTab("Config & Safety")
+    local cfgSec = cfgTab:NewSection("Config")
+
+    cfgSec:NewButton("Save Config", "Saves your settings to " .. CONFIG_FILE, function()
+        Config.Save(false)
+    end)
+
+    cfgSec:NewButton("Load Config", "Loads saved settings and syncs the toggles.", function()
+        if Config.Load(false) then Config.SyncUI() end
+    end)
+
+    cfgSec:NewButton("Delete Config", "Deletes the saved config file.", function()
+        Config.Delete()
+    end)
+
+    cfgSec:NewToggle("Auto-Save Config", "Saves every 15s whenever something changed.", function(state)
+        State.AutoSaveConfig = state
+        Alert("Auto-Save Config " .. (state and "Enabled" or "Disabled"), state and "Success" or "Error")
+    end)
+
+    local rejoinSec = cfgTab:NewSection("Auto-Rejoin Watchdog")
+
+    rejoinSec:NewToggle("Auto-Rejoin on Disconnect", "Waits out FE2's ~10s anti-rejoin cooldown, then rejoins after a kick or disconnect.", function(state)
+        State.AutoRejoinDisconnect = state
+        Alert("Auto-Rejoin (Disconnect) " .. (state and "Enabled" or "Disabled"), state and "Success" or "Error")
+    end)
+
+    rejoinSec:NewToggle("Auto-Rejoin on Stall", "Rejoins if Auto-Play/Auto-Farm stops making progress.", function(state)
+        State.AutoRejoinStall = state
+        Alert("Auto-Rejoin (Stall) " .. (state and "Enabled" or "Disabled"), state and "Success" or "Error")
+    end)
+
+    rejoinSec:NewTextBox("Stall Timeout (minutes)", "Minutes without a new map or escape. Default 8.", function(txt)
+        local num = tonumber(txt)
+        if num and num >= 1 then
+            State.StallMinutes = num
+            Alert("Stall timeout set to " .. tostring(num) .. " min.", "Info")
+        else
+            Alert("Enter a number of 1 or more.", "Error")
+        end
+    end)
+
+    rejoinSec:NewTextBox("Reload Source", "Workspace file name OR https link to this script.", function(txt)
+        txt = tostring(txt or ""):gsub("^%s*(.-)%s*$", "%1")
+        if txt:find("]=]", 1, true) then
+            Alert("That path contains unsupported characters.", "Error")
+            return
+        end
+        State.ReloadSource = txt
+        Alert(txt == "" and "Reload Source cleared." or ("Reload Source set: " .. txt), "Info")
+    end)
+
+    rejoinSec:NewTextBox("Rejoin Delay (seconds)", "Wait after a kick or disconnect before rejoining. Default 11.", function(txt)
+        local num = tonumber(txt)
+        if num and num >= 0 and num <= 120 then
+            State.RejoinDelay = num
+            Alert("Rejoin delay set to " .. tostring(num) .. "s.", "Info")
+        else
+            Alert("Enter a number from 0 to 120.", "Error")
+        end
+    end)
+
+    rejoinSec:NewButton("Rejoin Now", "Saves config, queues the reload and teleports (good for testing).", function()
+        Safety.Rejoin("Manual")
+    end)
+
+    local notifySec = cfgTab:NewSection("Discord Notifications")
+
+    notifySec:NewTextBox("Webhook URL", "Your own Discord webhook. It is saved in your config file.", function(txt)
+        txt = tostring(txt or ""):gsub("^%s*(.-)%s*$", "%1")
+        if txt == "" then
+            State.WebhookURL = ""
+            Alert("Webhook cleared.", "Warning")
+        elseif Notify.IsValidUrl(txt) then
+            State.WebhookURL = txt
+            Alert("Webhook set.", "Success")
+        else
+            Alert("That doesn't look like a Discord webhook URL.", "Error")
+        end
+    end)
+
+    notifySec:NewToggle("Send Webhook Notifications", "Pings your webhook on TAS failures, benching and rejoins.", function(state)
+        State.WebhookEnabled = state
+        Alert("Webhook Notifications " .. (state and "Enabled" or "Disabled"), state and "Success" or "Error")
+    end)
+
+    notifySec:NewButton("Test Webhook", "Sends a test message.", function()
+        if Notify.Send("Test message from Flood GUI.", true) then
+            Alert("Test message sent. Check Discord.", "Info")
+        else
+            Alert("Set a valid webhook URL first (or your executor has no request function).", "Error")
+        end
+    end)
+
+    local statsSec = cfgTab:NewSection("Session Stats")
+    local uptimeLabel = statsSec:NewLabel("Uptime: 0h 00m")
+    local mapsLabel = statsSec:NewLabel("Maps: 0 | Escapes: 0 (0.0/hr)")
+    local tasStatsLabel = statsSec:NewLabel("TAS runs: 0 ok / 0 failed")
+
+    local statsSession = {}
+    getgenv().FloodGUI_StatsSession = statsSession
+    task.spawn(function()
+        while getgenv().FloodGUI_StatsSession == statsSession do
+            local elapsed = os.clock() - RunStats.StartedAt
+            local hours = math.max(elapsed / 3600, 1 / 60)
+            local h = math.floor(elapsed / 3600)
+            local m = math.floor((elapsed % 3600) / 60)
+            pcall(function()
+                uptimeLabel:UpdateLabel(string.format("Uptime: %dh %02dm", h, m))
+                mapsLabel:UpdateLabel(string.format("Maps: %d | Escapes: %d (%.1f/hr)", RunStats.MapsSeen, RunStats.Escapes, RunStats.Escapes / hours))
+                tasStatsLabel:UpdateLabel(string.format("TAS runs: %d ok / %d failed", RunStats.SessionOk, RunStats.SessionFail))
+            end)
+            task.wait(5)
+        end
+    end)
+
     local credTab = Window:NewTab("Credits")
     local credSec = credTab:NewSection("Credits & Info")
     credSec:NewLabel("TAS System: Tomato (Base by Voiz#5668)")
@@ -2313,6 +3672,7 @@ local function InitializeUI()
     credSec:NewLabel("UI Library: xHeptc (Kavo)")
     credSec:NewLabel("TAS Auto-Sync: wo0psie")
     credSec:NewLabel("Lobby Tools: rokfx (github.com/4phi)")
+    credSec:NewLabel("Quick Farm: tomato.txt (Flood-GUI quickfarm)")
     
     credSec:NewButton("Copy Support Server Invite", "Copies Discord invite.", function()
         if setclipboard then
@@ -2322,7 +3682,10 @@ local function InitializeUI()
             Alert("Clipboard access not supported by your exploit.", "Warning")
         end
     end)
+
+    if State.FloatingButton then CreateFloatingButton() end
+    Config.SyncUI()
 end
 
 InitializeUI()
-Alert("Flood GUI v4 (TAS Player + Lobby Tools) Loaded Successfully!", "Success")
+Alert("Flood GUI v4 (TAS Player + Lobby + Config/Safety) Loaded Successfully!", "Success")
