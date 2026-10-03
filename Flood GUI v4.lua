@@ -55,6 +55,29 @@ local function TrackConnection(connection)
     return connection
 end
 
+-- Safe OnClientEvent when remote may be nil (FE2CM)
+local function SafeChildAdded(parent)
+    if parent then
+        return parent.ChildAdded
+    end
+    return {
+        Connect = function(_, _fn)
+            return { Disconnect = function() end }
+        end
+    }
+end
+
+local function SafeOnClient(remote)
+    if remote then
+        return remote.OnClientEvent
+    end
+    return {
+        Connect = function(_, _fn)
+            return { Disconnect = function() end }
+        end
+    }
+end
+
 local function AddTASConnection(conn)
     table.insert(getgenv().TASConnections, conn)
     return conn
@@ -75,23 +98,58 @@ local CoreGui = game:GetService("CoreGui")
 
 local LocalPlayer = Players.LocalPlayer
 local Camera = Workspace.CurrentCamera
-local Multiplayer = Workspace:WaitForChild("Multiplayer")
 
-local RemoteFolder = ReplicatedStorage:WaitForChild("Remote")
-local ReqPasskey = RemoteFolder:WaitForChild("ReqPasskey")
-local ReqRebirth = RemoteFolder:WaitForChild("ReqRebirth")
-local NewMapVote = RemoteFolder:WaitForChild("NewMapVote")
-local UpdMapVote = RemoteFolder:WaitForChild("UpdMapVote")
-local AddedWaiting = RemoteFolder:WaitForChild("AddedWaiting")
-local AlertRemote = RemoteFolder:WaitForChild("Alert")
-local AddMapEventRemote = RemoteFolder:FindFirstChild("AddMapEvent")
-local BoostIntensity = RemoteFolder:FindFirstChild("BoostIntensity")
-local ReqTele = RemoteFolder:FindFirstChild("ReqTele")
-local RemoveWaiting = RemoteFolder:FindFirstChild("RemoveWaiting")
-local PressedMapButton = RemoteFolder:FindFirstChild("PressedMapButton") or RemoteFolder:WaitForChild("PressedMapButton")
-local UpdGoalLocator = RemoteFolder:FindFirstChild("UpdGoalLocator") or RemoteFolder:WaitForChild("UpdGoalLocator")
-local SurvivedRemote = RemoteFolder:FindFirstChild("Survived") or RemoteFolder:WaitForChild("Survived")
-local LoadedMapRemote = RemoteFolder:FindFirstChild("LoadedMap")
+-- FE2CM (Community Maps) + main FE2 compatibility
+-- Hard WaitForChild on missing remotes freezes the whole script on FE2CM.
+local FE2CM_PLACE_IDS = {
+    [11951199229] = true, -- Flood Escape 2 Community Maps
+}
+local IS_FE2CM = FE2CM_PLACE_IDS[game.PlaceId] == true
+if not IS_FE2CM then
+    pcall(function()
+        local info = game:GetService("MarketplaceService"):GetProductInfo(game.PlaceId)
+        local n = string.lower(tostring(info and info.Name or ""))
+        if string.find(n, "community", 1, true) or string.find(n, "fe2cm", 1, true) then
+            IS_FE2CM = true
+        end
+    end)
+end
+
+local function WaitChild(parent, name, timeout)
+    if not parent then return nil end
+    local existing = parent:FindFirstChild(name)
+    if existing then return existing end
+    return parent:WaitForChild(name, timeout or 5)
+end
+
+local Multiplayer = WaitChild(Workspace, "Multiplayer", 15) or Workspace:FindFirstChild("Multiplayer")
+local RemoteFolder = WaitChild(ReplicatedStorage, "Remote", 10) or ReplicatedStorage:FindFirstChild("Remote")
+
+local function Remote(name, hardTimeout)
+    if not RemoteFolder then return nil end
+    local t = hardTimeout
+    if t == nil then t = IS_FE2CM and 3 or 8 end
+    return WaitChild(RemoteFolder, name, t) or RemoteFolder:FindFirstChild(name)
+end
+
+local ReqPasskey = Remote("ReqPasskey")
+local ReqRebirth = Remote("ReqRebirth")
+local NewMapVote = Remote("NewMapVote")
+local UpdMapVote = Remote("UpdMapVote")
+local AddedWaiting = Remote("AddedWaiting")
+local AlertRemote = Remote("Alert")
+local AddMapEventRemote = Remote("AddMapEvent", 2)
+local BoostIntensity = Remote("BoostIntensity", 2)
+local ReqTele = Remote("ReqTele", 2)
+local RemoveWaiting = Remote("RemoveWaiting", 2)
+local PressedMapButton = Remote("PressedMapButton", 3)
+local UpdGoalLocator = Remote("UpdGoalLocator", 3)
+local SurvivedRemote = Remote("Survived", 3)
+local LoadedMapRemote = Remote("LoadedMap", 2)
+
+if IS_FE2CM then
+    print("[Flood GUI]: FE2CM detected (PlaceId " .. tostring(game.PlaceId) .. ") — soft remote binding enabled")
+end
 
 local CONFIG = {
     UI_LIBRARY = "https://github.com/tomatotxt/Kavo-UI-Library/raw/refs/heads/main/source.lua",
@@ -109,7 +167,8 @@ local SAFE_ROOM_CFRAME = CFrame.new(-100.5, -222.95, -36.5)
 
 local PLACE_IDS = {
     Pro = 1273079594,
-    Normal = 738339342
+    Normal = 738339342,
+    FE2CM = 11951199229
 }
 
 local COLORS = {
@@ -212,9 +271,18 @@ local QF = {
 -- ==============================================================================
 -- [4] UTILITIES & ALERT SYSTEM
 -- ==============================================================================
-local CLMAIN = LocalPlayer:WaitForChild("PlayerScripts"):WaitForChild("CL_MAIN_GameScript")
+local PlayerScripts = LocalPlayer:FindFirstChild("PlayerScripts") or LocalPlayer:WaitForChild("PlayerScripts", 10)
+local CLMAIN = nil
+if PlayerScripts then
+    CLMAIN = PlayerScripts:FindFirstChild("CL_MAIN_GameScript")
+        or PlayerScripts:WaitForChild("CL_MAIN_GameScript", IS_FE2CM and 5 or 15)
+end
 local CLMAINenv = nil
-pcall(function() CLMAINenv = getsenv(CLMAIN) end)
+if CLMAIN then
+    pcall(function() CLMAINenv = getsenv(CLMAIN) end)
+else
+    warn("[Flood GUI]: CL_MAIN_GameScript not found — alerts/TAS anim hooks limited (common on FE2CM variants)")
+end
 
 local function Alert(Text, ColorType)
     local Output = tostring(Text)
@@ -278,6 +346,7 @@ local function Check(Flag)
 end
 
 local function GetSessionKey()
+    if not ReqPasskey then return nil end
     local success, key = pcall(function() return ReqPasskey:InvokeServer() end)
     return success and -key or nil
 end
@@ -1652,13 +1721,13 @@ function QF.GetTargetPart()
     return nil
 end
 
-QF.InstallHooks()
+pcall(function() QF.InstallHooks() end)
 
-TrackConnection(UpdGoalLocator.OnClientEvent:Connect(function(p1, p2, p3, p4)
+TrackConnection(SafeOnClient(UpdGoalLocator):Connect(function(p1, p2, p3, p4)
     QF.Goal, QF.Button, QF.Next = p1, p2, p4
 end))
 
-TrackConnection(AlertRemote.OnClientEvent:Connect(function(msg)
+TrackConnection(SafeOnClient(AlertRemote):Connect(function(msg)
     if QF.ExitPhase and type(msg) == "string" then
         local text = msg:lower()
         if text:find("escaped") or text:find("survived") then
@@ -1995,13 +2064,13 @@ end)
 -- ==============================================================================
 -- Auto-vote removed (was annoying)
 -- Only keep Record mode launcher if needed
-TrackConnection(NewMapVote.OnClientEvent:Connect(function(dataPacket)
+TrackConnection(SafeOnClient(NewMapVote):Connect(function(dataPacket)
     if State.Mode ~= "Record" then return end
     if not State.AutoFarm and not State.AutoPlay then return end
     -- Record mode still works, just no automatic voting
 end))
 
-TrackConnection(Multiplayer.ChildAdded:Connect(function(NewMap)
+TrackConnection(SafeChildAdded(Multiplayer):Connect(function(NewMap)
     if _G.LoopCancel or (not State.AutoFarm and not State.AutoPlay) then return end
     NewMap:GetPropertyChangedSignal("Name"):Wait()
 
@@ -2041,7 +2110,7 @@ TrackConnection(Multiplayer.ChildAdded:Connect(function(NewMap)
     end
 end))
 
-TrackConnection(AlertRemote.OnClientEvent:Connect(function(msg)
+TrackConnection(SafeOnClient(AlertRemote):Connect(function(msg)
     if type(msg) == "string" and msg:lower():match("escaped") then
         State.Escaped = true
         -- Flag only; MainLoop stops TAS after 0.5s. Do NOT set TAS_ManualStop
@@ -2245,11 +2314,11 @@ do
         CastInstantFullVote(targetMap, currentVotes)
     end
 
-    TrackConnection(NewMapVote.OnClientEvent:Connect(function()
+    TrackConnection(SafeOnClient(NewMapVote):Connect(function()
         fullVoteInProgress = false
     end))
 
-    TrackConnection(UpdMapVote.OnClientEvent:Connect(function(voteData)
+    TrackConnection(SafeOnClient(UpdMapVote):Connect(function(voteData)
         if State.AutoFullVote then
             TriggerAutoFullVote(voteData)
         end
@@ -2392,7 +2461,7 @@ do
         AddMapEventRemote:FireServer()
     end
 
-    TrackConnection(Multiplayer.ChildAdded:Connect(function(NewMap)
+    TrackConnection(SafeChildAdded(Multiplayer):Connect(function(NewMap)
         NewMap:GetPropertyChangedSignal("Name"):Wait()
         if State.AutoBoost then
             Lobby.FullBoost()
@@ -2791,7 +2860,7 @@ do
     TrackConnection(Multiplayer.ChildAdded:Connect(function()
         lastProgress = os.clock()
     end))
-    TrackConnection(AlertRemote.OnClientEvent:Connect(function(msg)
+    TrackConnection(SafeOnClient(AlertRemote):Connect(function(msg)
         if type(msg) == "string" and msg:lower():match("escaped") then
             lastProgress = os.clock()
         end
@@ -2848,7 +2917,7 @@ do
     end
 
     -- Tells you, every round, whether the current map has a TAS file
-    TrackConnection(Multiplayer.ChildAdded:Connect(function(NewMap)
+    TrackConnection(SafeChildAdded(Multiplayer):Connect(function(NewMap)
         local renamed = false
         local conn = NewMap:GetPropertyChangedSignal("Name"):Connect(function() renamed = true end)
         local t0 = os.clock()
@@ -2985,7 +3054,7 @@ do
     TrackConnection(Multiplayer.ChildAdded:Connect(function()
         RunStats.MapsSeen = RunStats.MapsSeen + 1
     end))
-    TrackConnection(AlertRemote.OnClientEvent:Connect(function(msg)
+    TrackConnection(SafeOnClient(AlertRemote):Connect(function(msg)
         if type(msg) == "string" and msg:lower():match("escaped") then
             RunStats.LastEscape = os.clock()
             if os.clock() - lastEscapeCounted > 5 then
@@ -3084,8 +3153,8 @@ do
         end
     end
 
-    TrackConnection(NewMapVote.OnClientEvent:Connect(TasPrefetch.FromVoteData))
-    TrackConnection(UpdMapVote.OnClientEvent:Connect(TasPrefetch.FromVoteData))
+    TrackConnection(SafeOnClient(NewMapVote):Connect(TasPrefetch.FromVoteData))
+    TrackConnection(SafeOnClient(UpdMapVote):Connect(TasPrefetch.FromVoteData))
 end
 
 RunStats.Load()
@@ -3683,9 +3752,20 @@ local function InitializeUI()
         end
     end)
 
-    if State.FloatingButton then CreateFloatingButton() end
-    Config.SyncUI()
+    if State.FloatingButton then pcall(CreateFloatingButton) end
+    pcall(function() Config.SyncUI() end)
 end
 
-InitializeUI()
-Alert("Flood GUI v4 (TAS Player + Lobby + Config/Safety) Loaded Successfully!", "Success")
+do
+    local okUI, errUI = pcall(InitializeUI)
+    if not okUI then
+        warn("[Flood GUI]: UI failed:", errUI)
+        pcall(function()
+            Alert("UI error — check console. Partial load.", "Error")
+        end)
+    else
+        pcall(function()
+            Alert("Flood GUI v4 loaded" .. (IS_FE2CM and " (FE2CM mode)" or "") .. "!", "Success")
+        end)
+    end
+end
