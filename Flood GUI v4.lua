@@ -6,9 +6,7 @@
 --      Reverse Engineering/Base GUI: Tomato
 --      UI Library: xHeptc (Kavo)
 --      Lobby Tools (Boosts/Voting/Auto-Join): rokfx (merged from FE2 Troll)
---      Config Save/Load, Auto-Rejoin Watchdog, TAS Library: added in merge
---      Run Tracking, Discord Notifications, TAS Prefetch, Floating Button: added in merge
---      Quick Farm (remote-based farm, Fast Load, God Mode): adapted from tomato.txt's quickfarm
+--      Config Save/Load, Auto-Rejoin Watchdog, TAS Library.
 -- ==============================================================================
 
 -- ==============================================================================
@@ -1085,6 +1083,104 @@ local function StartBuiltInTASPlayer()
         Elapsed = Elapsed or 0
 
         local checkSubmerged = IsInWater(RootPart.Position + Vector3.new(0, 1, 0))
+        -- TAS safety: a recorded swim animation is valid only while the character
+        -- is actually in water. This prevents stale/incorrect TAS frames from
+        -- forcing the swim animation while airborne or on solid ground.
+        local humanoidState = humanoid:GetState()
+        local actuallySwimming = checkSubmerged or humanoidState == Enum.HumanoidStateType.Swimming
+
+        -- TAS state validation: FE2 can briefly report Climbing while the player
+        -- is being moved by a wall-jump pad/weld. Do not let that transient state
+        -- force the climbing animation.
+        local walljumpWeld = RootPart:FindFirstChild("WalljumpWeld_Live")
+            or RootPart:FindFirstChild("WalljumpWeld_Server")
+        local walljumpFlag = getgenv().TAS_WalljumpActive == true
+
+        local function nearClimbSurface()
+            if walljumpWeld then return false end
+            local ok, parts = pcall(function()
+                return workspace:GetPartBoundsInRadius(RootPart.Position, 3.5)
+            end)
+            if not ok or type(parts) ~= "table" then return false end
+            for _, part in ipairs(parts) do
+                if part and part:IsA("BasePart") and part ~= RootPart then
+                    if part:IsA("TrussPart") then
+                        return true
+                    end
+                    local lowerName = string.lower(part.Name)
+                    if string.find(lowerName, "truss", 1, true) or string.find(lowerName, "ladder", 1, true) then
+                        return true
+                    end
+                    -- FE2 custom climb/wall objects commonly expose _Wall.
+                    if part:FindFirstChild("_Wall") then
+                        return true
+                    end
+                end
+            end
+            return false
+        end
+
+        local actuallyClimbing = humanoidState == Enum.HumanoidStateType.Climbing
+            and not walljumpWeld
+            and not walljumpFlag
+            and nearClimbSurface()
+
+        -- RIGOR.json records the wall-jump-pad state as `wallhang`. In the
+        -- original TAS data these frames have zero velocity and occur at wall-jump
+        -- contact points. A plain Roblox wall/Climbing state is not enough to
+        -- justify playing wallhang, because FE2 can transiently reuse Climbing
+        -- while a wall-jump pad is launching the player.
+        local function nearWalljumpSurface()
+            if walljumpWeld or walljumpFlag then
+                return true
+            end
+            local ok, parts = pcall(function()
+                return workspace:GetPartBoundsInRadius(RootPart.Position, 4.5)
+            end)
+            if not ok or type(parts) ~= "table" then return false end
+            for _, part in ipairs(parts) do
+                if part and part:IsA("BasePart") and part ~= RootPart then
+                    local lowerName = string.lower(part.Name)
+                    if part:FindFirstChild("_Wall")
+                        or string.find(lowerName, "walljump", 1, true)
+                        or string.find(lowerName, "wall_jump", 1, true)
+                        or string.find(lowerName, "wall pad", 1, true)
+                        or string.find(lowerName, "wallpad", 1, true) then
+                        return true
+                    end
+                end
+            end
+            return false
+        end
+
+        local actuallyWallHanging = nearWalljumpSurface()
+            and RootPart.Velocity.Magnitude <= 3.5
+            and humanoidState ~= Enum.HumanoidStateType.Swimming
+
+        local function fallbackMovementAnimation()
+            if humanoid.FloorMaterial == Enum.Material.Air then
+                return "fall"
+            elseif RootPart.Velocity.Magnitude > 1 then
+                return "walk"
+            else
+                return "idle"
+            end
+        end
+
+        if (n == "swim" or n == "swimidle") and not actuallySwimming then
+            n = nil
+            IsCurrentlySwimming = false
+            if character:FindFirstChild("Animate") and character.Animate:FindFirstChild("ToggleSwim") then
+                pcall(function() character.Animate.ToggleSwim:Fire(false) end)
+            end
+            if humanoid.FloorMaterial == Enum.Material.Air then
+                n = "fall"
+            elseif RootPart.Velocity.Magnitude > 1 then
+                n = "walk"
+            else
+                n = "idle"
+            end
+        end
 
         local gameSpeedMultiplier = TimeModifier * DynamicTimeScale
         local nativeSlideDuration = 0.5 / gameSpeedMultiplier
@@ -1227,6 +1323,30 @@ local function StartBuiltInTASPlayer()
                     if n == "fall" and RootPart.Velocity.Magnitude < 0.1 then n = "swing" end
                 end
             end
+        end
+
+        -- Final hard guard: never send a swim animation to the animator unless
+        -- the current frame is actually swimming.
+        if (n == "swim" or n == "swimidle") and not actuallySwimming then
+            n = fallbackMovementAnimation()
+            IsCurrentlySwimming = false
+            if character:FindFirstChild("Animate") and character.Animate:FindFirstChild("ToggleSwim") then
+                pcall(function() character.Animate.ToggleSwim:Fire(false) end)
+            end
+        end
+
+        -- Final hard guard for climbing and wall-jump-pad animation states.
+        if n == "climb" or n == "climbing" then
+            if not actuallyClimbing then
+                n = fallbackMovementAnimation()
+            end
+        elseif n == "wallhang" then
+            if not actuallyWallHanging then
+                n = fallbackMovementAnimation()
+            end
+        elseif humanoidState == Enum.HumanoidStateType.Climbing and (walljumpWeld or walljumpFlag) then
+            -- Wall-jump movement is launch/contact movement, not a climb animation.
+            n = fallbackMovementAnimation()
         end
 
         if n and (n ~= LastPlayedAnim) then
@@ -1404,9 +1524,12 @@ local function StartBuiltInTASPlayer()
             TrySync()
         end
         
+        -- Capture the wall-jump-pad state before the TAS loop removes FE2's
+        -- wall-jump welds. The animation validator uses this for the same frame.
         local liveWeld = RootPart:FindFirstChild("WalljumpWeld_Live")
-        if liveWeld then liveWeld:Destroy() end
         local serverWeld = RootPart:FindFirstChild("WalljumpWeld_Server")
+        getgenv().TAS_WalljumpActive = (liveWeld ~= nil or serverWeld ~= nil)
+        if liveWeld then liveWeld:Destroy() end
         if serverWeld then serverWeld:Destroy() end
         -- break any live zipline constraints the game tried to attach
         for _, ch in ipairs(RootPart:GetChildren()) do
@@ -14302,8 +14425,12 @@ local function InitializeUI()
     credSec:NewLabel("TAS System: Tomato (Base by Voiz#5668)")
     credSec:NewLabel("Reverse Engineering/Base GUI: Tomato")
     credSec:NewLabel("UI Library: xHeptc (Kavo)")
-    credSec:NewLabel("TAS Auto-Sync: Wo0psie")
-    credSec:NewLabel("Remotes: ltseverydayyou ")
+    credSec:NewLabel("TAS Auto-Sync: wo0psie")
+    credSec:NewLabel("Lobby Tools: rokfx (github.com/4phi)")
+    credSec:NewLabel("Quick Farm: tomato.txt (Flood-GUI quickfarm)")
+    credSec:NewLabel("Fe2AutoFarm backend: embedded in the FE2 AutoFarm tab (single GUI mode)")
+    credSec:NewLabel("Map Tools: from Map TP Spam (SCW + MOM)")
+    credSec:NewLabel("Aura / Smart Rebirth ideas: ltseverydayyou (Fe2AutoFarm)")
     
     credSec:NewButton("Copy Support Server Invite", "Copies Discord invite.", function()
         if setclipboard then
