@@ -6,7 +6,9 @@
 --      Reverse Engineering/Base GUI: Tomato
 --      UI Library: xHeptc (Kavo)
 --      Lobby Tools (Boosts/Voting/Auto-Join): rokfx (merged from FE2 Troll)
---      Config Save/Load, Auto-Rejoin Watchdog, TAS Library.
+--      Config Save/Load, Auto-Rejoin Watchdog, TAS Library: added in merge
+--      Run Tracking, Discord Notifications, TAS Prefetch, Floating Button: added in merge
+--      Quick Farm (remote-based farm, Fast Load, God Mode): adapted from tomato.txt's quickfarm
 -- ==============================================================================
 
 -- ==============================================================================
@@ -1904,16 +1906,7 @@ TrackConnection(LocalPlayer.CharacterAdded:Connect(function()
     QF.ResettingCharacter = false
 end))
 
--- God Mode: keep health pinned at 1000 (reset paths set ResettingCharacter to bypass it)
-TrackConnection(RunService.Heartbeat:Connect(function()
-    if not State.GodMode or QF.ResettingCharacter or State.ResettingForDifficulty then return end
-    local char = LocalPlayer.Character
-    local hum = char and char:FindFirstChildOfClass("Humanoid")
-    if hum and hum.Health > 0 then
-        if hum.MaxHealth ~= 1000 then hum.MaxHealth = 1000 end
-        if hum.Health < 1000 then hum.Health = 1000 end
-    end
-end))
+-- God Mode is backed by the FE2 Infinite Air implementation. The old health-pinning loop was removed.
 
 task.spawn(function()
     QF.Passkey = GetSessionKey()
@@ -13827,8 +13820,9 @@ local function InitializeUI()
         Alert("Fast Load " .. (state and "Enabled" or "Disabled"), state and "Success" or "Error")
     end)
 
-    qfSec:NewToggle("Enable God Mode", "Keeps your health at 1000.", function(state)
+    qfSec:NewToggle("Enable God Mode", "Uses the FE2 Infinite Air script as God Mode.", function(state)
         State.GodMode = state
+        Fe2Set("infAirOn", state)
         Alert("God Mode " .. (state and "Enabled" or "Disabled"), state and "Success" or "Error")
     end)
 
@@ -14066,10 +14060,6 @@ local function InitializeUI()
 
     fe2BlatantSec:NewToggle("DevTools", "Enable the FE2 developer tools.", function(state)
         Fe2Set("devOn", state)
-    end)
-
-    fe2BlatantSec:NewToggle("Infinite Air", "Enable the FE2 infinite-air option.", function(state)
-        Fe2Set("infAirOn", state)
     end)
 
     local assistSec = blatantTab:NewSection("Assist")
