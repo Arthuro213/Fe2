@@ -96,16 +96,69 @@ end
 -- Configurations rather than hardcoding any one map's numbers.
 local PadConnections = {}
 
--- LocalPlayer.CharacterAdded:Wait() has no timeout. If a kill doesn't register as
--- death on this character/rig, the creator freezes right there with no way out.
-local function WaitForCharacterAdded(timeoutSeconds)
-    local fired = false
-    local conn
-    conn = LocalPlayer.CharacterAdded:Connect(function() fired = true end)
-    local t0 = os.clock()
-    while not fired and os.clock() - t0 < timeoutSeconds do task.wait() end
-    if conn then conn:Disconnect() end
-    return fired
+-- Force a respawn without racing CharacterAdded. The listener is connected BEFORE
+-- killing the character, because FE2CM can respawn quickly enough that a later
+-- CharacterAdded:Wait() misses the event. A few guarded retries handle scripts that
+-- restore Health on the first attempt.
+local function ForceRespawnCharacter(oldCharacter, timeoutSeconds)
+    oldCharacter = oldCharacter or LocalPlayer.Character
+    local nextCharacter = nil
+    local addedConnection = LocalPlayer.CharacterAdded:Connect(function(character)
+        if character ~= oldCharacter then
+            nextCharacter = character
+        end
+    end)
+
+    local current = LocalPlayer.Character
+    if current and current ~= oldCharacter then
+        nextCharacter = current
+    end
+
+    local deadline = os.clock() + (timeoutSeconds or 12)
+    local nextRetry = 0
+    while not nextCharacter and os.clock() < deadline do
+        current = LocalPlayer.Character
+        if current and current ~= oldCharacter then
+            nextCharacter = current
+            break
+        end
+
+        if os.clock() >= nextRetry then
+            nextRetry = os.clock() + 0.35
+            local oldHumanoid = oldCharacter and oldCharacter:FindFirstChildOfClass("Humanoid")
+            if oldHumanoid then
+                pcall(function()
+                    oldHumanoid.Health = 0
+                    oldHumanoid:ChangeState(Enum.HumanoidStateType.Dead)
+                end)
+            end
+            pcall(function()
+                if oldCharacter and oldCharacter.Parent then
+                    oldCharacter:BreakJoints()
+                end
+            end)
+        end
+        task.wait(0.05)
+    end
+
+    -- Check the Character property one last time in case the event was delivered
+    -- while the wait was yielding or the listener was created during a respawn.
+    current = LocalPlayer.Character
+    if not nextCharacter and current and current ~= oldCharacter then
+        nextCharacter = current
+    end
+    if addedConnection then addedConnection:Disconnect() end
+
+    if nextCharacter then
+        local ok, humanoid, root = pcall(function()
+            return nextCharacter:WaitForChild("Humanoid", 10),
+                nextCharacter:WaitForChild("HumanoidRootPart", 10)
+        end)
+        if ok and humanoid and root and nextCharacter == LocalPlayer.Character then
+            return nextCharacter
+        end
+    end
+    return nil
 end
 
 local function ApplyXFrame(xf, root, hum)
@@ -767,19 +820,40 @@ local function SyncButtonState(VisualTime, RealTime)
     end
 end
 
-local function HookAnimations()
+local function HookAnimations(character)
+    character = character or LocalPlayer.Character
+    if not character then return false end
+
+    local animate = character:FindFirstChild("Animate") or character:WaitForChild("Animate", 10)
+    if not animate then return false end
+
+    -- Animate's execution environment can take a short time to initialize after a reset.
+    -- Bound the wait so a missing/disabled script cannot block the rest of reinitialization.
+    local deadline = os.clock() + 5
+    local env
     repeat
-        local script = LocalPlayer.Character:WaitForChild("Animate")
-        AnimEnv = getsenv(script)
-        task.wait()
-    until AnimEnv.playAnimation ~= nil
-    OriginalPlayAnim = AnimEnv.playAnimation
-    AnimEnv.playAnimation = function(anim, speed)
+        if character ~= LocalPlayer.Character then return false end
+        local ok, result = pcall(getsenv, animate)
+        if ok and type(result) == "table" and type(result.playAnimation) == "function" then
+            env = result
+            break
+        end
+        task.wait(0.05)
+    until os.clock() >= deadline
+
+    if not env then return false end
+    local original = env.playAnimation
+    AnimEnv = env
+    OriginalPlayAnim = original
+    env.playAnimation = function(anim, speed)
+        if character ~= LocalPlayer.Character then return end
         if not IsPaused then
             CurrentAnim = {anim, speed}
-            OriginalPlayAnim(CurrentAnim[1], CurrentAnim[2], LocalPlayer.Character.Humanoid)
+            local humanoid = character:FindFirstChildOfClass("Humanoid")
+            if humanoid then pcall(original, CurrentAnim[1], CurrentAnim[2], humanoid) end
         end
     end
+    return true
 end
 
 -- // CLEANUP //
@@ -882,8 +956,14 @@ function LoadLastSavestate()
         
         SyncButtonState(Frame.Time, Frame.Time); UpdateMapState(Frame.Time)
         
-        OriginalPlayAnim(Frame.Animation[1], Frame.Animation[2], LocalPlayer.Character.Humanoid)
-        if Frame.Animation[1] == "walk" then AnimEnv.setAnimationSpeed(0.76) end
+        local currentCharacter = LocalPlayer.Character
+        local currentHumanoid = currentCharacter and currentCharacter:FindFirstChildOfClass("Humanoid")
+        if currentHumanoid and type(OriginalPlayAnim) == "function" then
+            pcall(OriginalPlayAnim, Frame.Animation[1], Frame.Animation[2], currentHumanoid)
+        end
+        if Frame.Animation[1] == "walk" and AnimEnv and type(AnimEnv.setAnimationSpeed) == "function" then
+            pcall(AnimEnv.setAnimationSpeed, 0.76)
+        end
         
         task.spawn(function() UpdateTimeDisplay(Frame.Time) end)
         SendAlert("Savestate Loaded", Color3.fromRGB(0, 255, 255))
@@ -1118,7 +1198,7 @@ local function SetupMap()
             Root.Anchored = false
             Hum:ChangeState(Enum.HumanoidStateType.Running)
             if LiveExitRegion then
-                Root.CFrame = LiveExitRegion.CFrame + Vector3.new(0, 100, 0); Root.Velocity = Vector3.new(0,0,0)
+                Root.CFrame = LiveExitRegion.CFrame + Vector3.new(0, 500, 0); Root.Velocity = Vector3.new(0,0,0)
             else
                 Root.CFrame = LastSafePos + Vector3.new(0, 10, 0); Root.Velocity = Vector3.new(0,0,0)
             end
@@ -1169,43 +1249,79 @@ local function SetupMap()
     MapX, MapY, MapZ = MapPos.X, MapPos.Y, MapPos.Z
     MapOffset = CFrame.new(MapX, MapY, MapZ)
     
-    Char.Humanoid.Health = 0
     SendAlert("Respawning...", Color3.fromRGB(255, 255, 0))
-    LocalPlayer.CharacterAdded:Wait(); Char = LocalPlayer.Character; task.wait(1)
+    local firstRespawn = ForceRespawnCharacter(Char, 12)
+    if firstRespawn then
+        Char = firstRespawn
+        task.wait(1)
+    else
+        SendAlert("First respawn timed out; retrying with current character", Color3.fromRGB(255, 170, 0))
+        Char = LocalPlayer.Character or Char
+    end
 
-    -- Keep the FE2CM double-respawn sequence from the known-working version;
-    -- this reinitializes FE2_Character's zipline state after the map clone is ready.
-    Char:BreakJoints()
+    -- Keep FE2CM's required double-respawn initialization for zipline state, but
+    -- register CharacterAdded before attempting the second kill so the event can't
+    -- be missed. Retry health/state changes until a genuinely new character appears.
     SendAlert("Double Respawning...", Color3.fromRGB(255, 255, 0))
-    LocalPlayer.CharacterAdded:Wait(); Char = LocalPlayer.Character; task.wait(5)
+    local secondRespawn = ForceRespawnCharacter(Char, 12)
+    if secondRespawn then
+        Char = secondRespawn
+        task.wait(5)
+    else
+        SendAlert("Second respawn did not complete; continuing with current character", Color3.fromRGB(255, 170, 0))
+        Char = LocalPlayer.Character or Char
+        task.wait(1)
+    end
     
-    local FE2Character = Char:WaitForChild("FE2_Character")
-    local FE2Env = getsenv(FE2Character)
-    local startZipline = FE2Env.startZipline
-    if type(startZipline) == "function" then
+    -- Keep the rope upvalue attached to the CURRENT character. FE2_Character is
+    -- recreated on respawn, so retaining startZipline from the old character breaks
+    -- ziplines even though RopeTable itself is still valid.
+    local ZiplineBindGeneration = 0
+    local ZiplineDataAlerted = false
+    local function BindZiplineCharacter(character)
+        ZiplineBindGeneration += 1
+        local bindGeneration = ZiplineBindGeneration
         task.spawn(function()
-            local announced = false
-            while Char and Char.Parent do
-                local currentHumanoid = Char:FindFirstChildOfClass("Humanoid")
+            local deadline = os.clock() + 15
+            local startZipline
+            repeat
+                if bindGeneration ~= ZiplineBindGeneration or character ~= LocalPlayer.Character or not character.Parent then return end
+                local fe2Character = character:FindFirstChild("FE2_Character")
+                if fe2Character then
+                    local ok, env = pcall(getsenv, fe2Character)
+                    if ok and type(env) == "table" and type(env.startZipline) == "function" then
+                        startZipline = env.startZipline
+                        break
+                    end
+                end
+                task.wait(0.1)
+            until os.clock() >= deadline
+
+            if type(startZipline) ~= "function" then
+                if bindGeneration == ZiplineBindGeneration then
+                    SendAlert("Zipline setup unavailable for current character.", Color3.fromRGB(255, 170, 0))
+                end
+                return
+            end
+
+            while bindGeneration == ZiplineBindGeneration and character == LocalPlayer.Character and character.Parent do
+                local currentHumanoid = character:FindFirstChildOfClass("Humanoid")
                 if not currentHumanoid or currentHumanoid.Health < 1 then break end
-                -- Match the known-working FE2CM version: keep the rope-table upvalue
-                -- pinned while the character lives. Unlike the older one-shot check,
-                -- this also recovers when rope data arrives late.
-                if type(RopeTable) == "table" and #RopeTable > 0 then
+                -- Keep the captured live-map rope table pinned while this character lives.
+                if type(RopeTable) == "table" and #RopeTable > 0 and type(setupvalue) == "function" then
                     local ok = pcall(setupvalue, startZipline, 2, RopeTable)
-                    if ok and not announced then
-                        announced = true
+                    if ok and not ZiplineDataAlerted then
+                        ZiplineDataAlerted = true
                         SendAlert("Zipline Data Restored", Color3.fromRGB(0, 255, 255))
                     end
                 end
                 task.wait(0.05)
             end
         end)
-    else
-        SendAlert("Zipline setup unavailable: startZipline was not found.", Color3.fromRGB(255, 170, 0))
     end
-    
+
     Root = Char:WaitForChild("HumanoidRootPart"); Hum = Char:WaitForChild("Humanoid")
+    BindZiplineCharacter(Char)
     BindLocalPads(ClonedMap, Char, Root, Hum)
     SendAlert("Pads bound: jump / teleport / speed timelines will now work on the clone", Color3.fromRGB(0, 255, 255))
     Hum.WalkSpeed = 0; Hum.JumpPower = 0; task.wait(0.5); Hum.WalkSpeed = 0; Hum.JumpPower = 0
@@ -1216,9 +1332,48 @@ local function SetupMap()
     table.insert(Savestates, {PackFrame(0, Vector3.new(0,0,0), GetPlayerCFrame(), workspace.CurrentCamera.CFrame, {"idle", 0})})
     PauseStart = tick(); RunStart = tick(); HookAnimations()
     
+    -- A reset replaces the character, root part, humanoid, Animate environment, and
+    -- FE2_Character script. Rebind every character-dependent feature before restoring
+    -- the last savestate; pad callbacks otherwise keep references to the dead character.
+    local CharacterBindGeneration = 0
     AddConnection(LocalPlayer.CharacterAdded:Connect(function(c)
-        local anim = c:WaitForChild("Animate")
-        if anim.Enabled then HookAnimations() end
+        CharacterBindGeneration += 1
+        local bindGeneration = CharacterBindGeneration
+        task.spawn(function()
+            local newHum = c:WaitForChild("Humanoid", 15)
+            local newRoot = c:WaitForChild("HumanoidRootPart", 15)
+            if not newHum or not newRoot then return end
+            if bindGeneration ~= CharacterBindGeneration or c ~= LocalPlayer.Character then return end
+            if not ClonedMap or not ClonedMap.Parent then return end
+
+            Char, Root, Hum = c, newRoot, newHum
+            getgenv().PauseSpoofing = false
+            pcall(function() newHum.WalkSpeed = 20 end)
+            pcall(function() newHum.JumpPower = 50 end)
+
+            BindLocalPads(ClonedMap, c, newRoot, newHum)
+            BindZiplineCharacter(c)
+
+            local anim = c:WaitForChild("Animate", 10)
+            if anim and anim.Enabled then
+                -- Refresh the playback function from this character's Animate environment.
+                HookAnimations(c)
+            end
+
+            if bindGeneration ~= CharacterBindGeneration or c ~= LocalPlayer.Character then return end
+            if ClonedMap and ClonedMap.Parent and #Savestates > 0 then
+                IsPaused = true
+                task.wait(0.1)
+                if bindGeneration == CharacterBindGeneration and c == LocalPlayer.Character then
+                    local ok = pcall(LoadLastSavestate)
+                    if ok then
+                        SendAlert("Character reset: pads, teleports and ziplines rebound", Color3.fromRGB(0, 255, 255))
+                    else
+                        SendAlert("Character reset: systems rebound, savestate restore failed", Color3.fromRGB(255, 170, 0))
+                    end
+                end
+            end
+        end)
     end))
     
     LoadUI(MapName)
@@ -1918,9 +2073,6 @@ local InputEndCon = UserInputService.InputEnded:Connect(function(input, gpe)
 end)
 AddConnection(InputEndCon)
 
-local DiedCon = LocalPlayer.Character.Humanoid.Died:Connect(function()
-    task.wait(0.1); if not IsPaused then TogglePause() end
-    LocalPlayer.CharacterAdded:Wait(); task.wait(0.1)
-    if ClonedMap and ClonedMap.Parent then LoadLastSavestate() end
-end)
-AddConnection(DiedCon)
+-- Respawn recovery is handled by the CharacterAdded rebinder inside SetupMap.
+-- A one-time Humanoid.Died connection becomes stale after the first reset, so do not
+-- attach another listener to only the initial character here.
