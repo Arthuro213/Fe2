@@ -11,6 +11,7 @@ getgenv().ShowTASPathDuringPlayback = false
 getgenv().PlaybackCamera = false
 getgenv().ShowVelocityPredictor = false
 getgenv().EnableAutoSwim = true -- Added default configuration
+getgenv().PreloadTASFile = getgenv().PreloadTASFile or "" -- Optional startup preload filename
 
 local Keybinds = {
     AddSavestate = "One",
@@ -404,6 +405,26 @@ local TrajectoryLines = {}
 local PathLines = {}
 local SelectedFileToLoad = ""
 
+-- // IMPORTED FILE TIMELINE EDITOR STATE //
+local PlaybackState = {
+    Active = false, Paused = false, Time = 0, PlayStart = 0,
+    Data = nil, OldFrame = 1, Offset = nil
+}
+local PreloadedTASData = nil
+local PreloadedTASFilename = ""
+local LoadedEditorFilename = ""
+local SpeedEditSavedThisLoad = false
+local LoadedFileMode = false
+local PendingEditCut = false
+local PendingEditTime = 0
+local LastEditorTime = 0
+local FileTimestampBox = nil
+local FileTimestampStatus = nil
+local PreloadTASFile, LoadPreloadedRunIntoEditor, BuildFileTimestampControl, BuildSpeedEditControl
+local ParsePlaybackTimestamp, FormatPlaybackTimestamp, DecodeTASFile
+local JsonFrameToPacked, ConvertTASDataToFrames, ApplyPackedFrameAtTime
+local SeekLoadedTAS, CutFramesAfterTime
+
 -- // UI Variables //
 local TAS_UI = loadstring(game:HttpGet(UI_API_URL))()
 local UI_Elements = nil
@@ -549,22 +570,47 @@ end
 
 local function RefreshFileList()
     if not UI_Elements or not UI_Elements.FileList then return end
-    for _, child in ipairs(UI_Elements.FileList:GetChildren()) do if child:IsA("TextButton") then child:Destroy() end end
+    for _, child in ipairs(UI_Elements.FileList:GetChildren()) do
+        if child:IsA("TextButton") then child:Destroy() end
+    end
     if not listfiles or not isfolder then return end
+
     pcall(function()
         if not isfolder("Flood-GUI/TAS FILES") then makefolder("Flood-GUI/TAS FILES") end
+        local files = {}
         for _, file in ipairs(listfiles("Flood-GUI/TAS FILES")) do
-            if file:match("%.json$") then
-                local filename = file:match("([^/\\]+)$")
-                local btn = Instance.new("TextButton")
-                btn.Size = UDim2.new(1, -10, 0, 30); btn.BackgroundColor3 = Color3.fromRGB(40,40,45)
-                btn.Text = filename; btn.TextColor3 = Color3.new(1,1,1); btn.Font = Enum.Font.Gotham
-                btn.Parent = UI_Elements.FileList
-                btn.Activated:Connect(function()
+            if file:match("%.json$") then files[#files + 1] = file:match("([^/\\]+)$") end
+        end
+
+        for _, filename in ipairs(files) do
+            local btn = Instance.new("TextButton")
+            btn.Size = UDim2.new(1, -10, 0, 30)
+            btn.BackgroundColor3 = Color3.fromRGB(40,40,45)
+            btn.Text = filename
+            btn.TextColor3 = Color3.new(1,1,1)
+            btn.Font = Enum.Font.Gotham
+            btn.Parent = UI_Elements.FileList
+            btn.Activated:Connect(function()
+                SelectedFileToLoad = filename
+                if UI_Elements.SelectedLabel then UI_Elements.SelectedLabel.Text = "Selected: " .. filename end
+                PreloadTASFile(filename)
+            end)
+        end
+
+        local wanted = tostring(getgenv().PreloadTASFile or "")
+        if wanted ~= "" then
+            for _, filename in ipairs(files) do
+                if filename == wanted then
                     SelectedFileToLoad = filename
                     if UI_Elements.SelectedLabel then UI_Elements.SelectedLabel.Text = "Selected: " .. filename end
-                end)
+                    PreloadTASFile(filename, true)
+                    break
+                end
             end
+        elseif #files == 1 then
+            SelectedFileToLoad = files[1]
+            if UI_Elements.SelectedLabel then UI_Elements.SelectedLabel.Text = "Selected: " .. files[1] end
+            PreloadTASFile(files[1], true)
         end
     end)
 end
@@ -658,9 +704,18 @@ local function BindUI()
     end)
     btns.RefreshList.Activated:Connect(RefreshFileList)
     btns.LoadRun.Activated:Connect(function()
-        if SelectedFileToLoad == "" then SendAlert("No file selected!", Color3.fromRGB(255,0,0)); return end
-        pcall(function() PlaybackTAS(HttpService:JSONDecode(readfile("Flood-GUI/TAS FILES/" .. SelectedFileToLoad))) end)
+        if SelectedFileToLoad == "" then
+            SendAlert("No file selected!", Color3.fromRGB(255, 0, 0))
+            return
+        end
+        if PreloadedTASFilename ~= SelectedFileToLoad or not PreloadedTASData then
+            if not PreloadTASFile(SelectedFileToLoad) then return end
+        end
+        LoadPreloadedRunIntoEditor()
     end)
+
+    BuildFileTimestampControl(btns.LoadRun)
+    BuildSpeedEditControl(btns.LoadRun)
 
     RefreshFileList()
 end
@@ -668,6 +723,20 @@ end
 local function LoadUI(MapName)
     if UI_Elements and UI_Elements.ScreenGui and UI_Elements.ScreenGui.Parent then return end
     UI_Elements = TAS_UI.Create()
+
+    -- Scale only the main TAS interface. The mobile Numpad is a sibling of
+    -- LayoutContainer under ScreenGui, so it keeps its original size.
+    local MainLayout = UI_Elements.ScreenGui and UI_Elements.ScreenGui:FindFirstChild("LayoutContainer")
+    if MainLayout then
+        local MainScale = MainLayout:FindFirstChildOfClass("UIScale")
+        if not MainScale then
+            MainScale = Instance.new("UIScale")
+            MainScale.Name = "MainInterfaceScale"
+            MainScale.Parent = MainLayout
+        end
+        MainScale.Scale = 0.8 -- 20% smaller; does not scale the Numpad
+    end
+
     TimeText = UI_Elements.TimeText
     FrameCountLabel = UI_Elements.FrameCount
     StatusLabel = UI_Elements.StatusText
@@ -820,6 +889,471 @@ local function SyncButtonState(VisualTime, RealTime)
     end
 end
 
+ParsePlaybackTimestamp = function(text)
+    text = tostring(text or ""):gsub("%s+", "")
+    if text == "" then return nil end
+
+    local plain = tonumber(text)
+    if plain then return math.max(0, plain) end
+
+    local parts = {}
+    for part in text:gmatch("[^:]+") do table.insert(parts, part) end
+    if #parts == 2 or #parts == 3 then
+        local n = {}
+        for i, part in ipairs(parts) do n[i] = tonumber(part) end
+        for i = 1, #n do if not n[i] then return nil end end
+        if #n == 2 then return math.max(0, n[1] * 60 + n[2]) end
+        return math.max(0, n[1] * 3600 + n[2] * 60 + n[3])
+    end
+    return nil
+end
+
+FormatPlaybackTimestamp = function(t)
+    t = math.max(0, tonumber(t) or 0)
+    local h = math.floor(t / 3600)
+    local m = math.floor((t % 3600) / 60)
+    local sec = t % 60
+    if h > 0 then return string.format("%d:%02d:%06.3f", h, m, sec) end
+    return string.format("%d:%06.3f", m, sec)
+end
+
+DecodeTASFile = function(filename)
+    if not filename or filename == "" then return nil, "No filename" end
+    if not isfile or not readfile then return nil, "File API unavailable" end
+    local path = "Flood-GUI/TAS FILES/" .. filename
+    if isfile and not isfile(path) then return nil, "File not found" end
+    local ok, raw = pcall(readfile, path)
+    if not ok then return nil, raw end
+    local ok2, data = pcall(HttpService.JSONDecode, HttpService, raw)
+    if not ok2 or type(data) ~= "table" or #data == 0 then return nil, "Invalid/empty TAS JSON" end
+    return data
+end
+
+PreloadTASFile = function(filename, quiet)
+    local data, err = DecodeTASFile(filename)
+    if not data then
+        PreloadedTASData = nil
+        PreloadedTASFilename = ""
+        if not quiet then SendAlert("Could not preload " .. tostring(filename) .. ": " .. tostring(err), Color3.fromRGB(255, 0, 0)) end
+        return false
+    end
+    PreloadedTASData = data
+    PreloadedTASFilename = filename
+    if not quiet then SendAlert("Preloaded " .. filename .. " (" .. #data .. " frames)", Color3.fromRGB(0, 255, 255)) end
+    if FileTimestampStatus then FileTimestampStatus.Text = "READY • " .. FormatPlaybackTimestamp(data[#data].time or 0) end
+    return true
+end
+
+JsonFrameToPacked = function(entry)
+    if type(entry) ~= "table" or type(entry.CCFrame) ~= "table" or type(entry.CCameraCFrame) ~= "table" or type(entry.VVelocity) ~= "table" then return nil end
+    local c, cam, vel = entry.CCFrame, entry.CCameraCFrame, entry.VVelocity
+    if #c < 6 or #cam < 6 or #vel < 3 then return nil end
+    local cf = CFrame.new(c[1], c[2], c[3]) * CFrame.fromEulerAnglesXYZ(c[4], c[5], c[6])
+    local camcf = CFrame.new(cam[1], cam[2], cam[3]) * CFrame.fromEulerAnglesXYZ(cam[4], cam[5], cam[6])
+    local anim = type(entry.AAnimation) == "table" and entry.AAnimation or {"walk", 0.1}
+    return PackFrame(tonumber(entry.time) or 0, Vector3.new(vel[1] or 0, vel[2] or 0, vel[3] or 0), cf, camcf, anim)
+end
+
+ConvertTASDataToFrames = function(data)
+    local packed = {}
+    for i = 1, #data do
+        local frame = JsonFrameToPacked(data[i])
+        if frame then packed[#packed + 1] = frame end
+    end
+    return packed
+end
+
+ApplyPackedFrameAtTime = function(packed, targetTime)
+    if type(packed) ~= "table" or #packed == 0 then return nil end
+    targetTime = math.max(0, tonumber(targetTime) or 0)
+    local first, last = UnpackFrame(packed[1]), UnpackFrame(packed[#packed])
+    targetTime = math.clamp(targetTime, first.Time, last.Time)
+    local lo, hi = 1, #packed
+    while lo < hi do
+        local mid = math.floor((lo + hi + 1) / 2)
+        if UnpackFrame(packed[mid]).Time <= targetTime then lo = mid else hi = mid - 1 end
+    end
+    local a = UnpackFrame(packed[lo])
+    local b = UnpackFrame(packed[math.min(lo + 1, #packed)])
+    local span = b.Time - a.Time
+    local alpha = span > 0 and math.clamp((targetTime - a.Time) / span, 0, 1) or 0
+    local cf, vel, cam = a.CFrame:Lerp(b.CFrame, alpha), a.Velocity:Lerp(b.Velocity, alpha), a.CameraCFrame:Lerp(b.CameraCFrame, alpha)
+    local character = LocalPlayer.Character
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    if root then
+        root.Anchored = true
+        root.CFrame = cf + Vector3.new(MapX, MapY - 1000, MapZ)
+        root.Velocity = vel
+        SavedVelocity = vel
+    end
+    if workspace.CurrentCamera then workspace.CurrentCamera.CFrame = cam + Vector3.new(MapX, MapY - 1000, MapZ) end
+    local anim = a.Animation or {"walk", 0.1}
+    local hum = character and character:FindFirstChildOfClass("Humanoid")
+    if OriginalPlayAnim and hum then pcall(OriginalPlayAnim, anim[1], anim[2], hum) end
+    if anim[1] == "walk" and AnimEnv and AnimEnv.setAnimationSpeed then pcall(AnimEnv.setAnimationSpeed, 0.76) end
+    SyncButtonState(targetTime, targetTime)
+    UpdateMapState(targetTime)
+    UpdateTimeDisplay(targetTime)
+    return targetTime
+end
+
+LoadPreloadedRunIntoEditor = function()
+    if type(PreloadedTASData) ~= "table" or #PreloadedTASData == 0 then
+        SendAlert("Select/preload a TAS file first", Color3.fromRGB(255, 170, 0))
+        return false
+    end
+    local packed = ConvertTASDataToFrames(PreloadedTASData)
+    if #packed == 0 then
+        SendAlert("TAS file contains no usable frames", Color3.fromRGB(255, 0, 0))
+        return false
+    end
+    PlaybackState.Active = false
+    PlaybackState.Paused = false
+    PlaybackState.Data = nil
+    IsViewingTAS = false
+    LoadedFileMode = true
+    PendingEditCut = false
+    LoadedEditorFilename = PreloadedTASFilename
+    SpeedEditSavedThisLoad = false
+    PendingEditTime = UnpackFrame(packed[1]).Time
+    Frames = packed
+    Savestates = {}
+    PreviewOffset = 0
+    TimeOffset = 0
+    local first = UnpackFrame(Frames[1])
+    LastEditorTime = first.Time
+    RunStart = tick() - first.Time
+    PauseStart = tick()
+    IsPaused = true
+    local character = LocalPlayer.Character
+    local root = character and character:FindFirstChild("HumanoidRootPart")
+    if root then root.Anchored = true end
+    ApplyPackedFrameAtTime(Frames, first.Time)
+    if UI_Elements and UI_Elements.SaveBox and PreloadedTASFilename ~= "" then UI_Elements.SaveBox.Text = PreloadedTASFilename:gsub("%.json$", "") end
+    if FileTimestampBox then FileTimestampBox.Text = FormatPlaybackTimestamp(first.Time) end
+    if FileTimestampStatus then FileTimestampStatus.Text = "LOADED • " .. FormatPlaybackTimestamp(UnpackFrame(Frames[#Frames]).Time) end
+    SendAlert("Loaded " .. PreloadedTASFilename .. " instantly — ready to edit", Color3.fromRGB(0, 255, 100))
+    return true
+end
+
+SeekLoadedTAS = function(targetTime)
+    if not LoadedFileMode or #Frames == 0 then
+        SendAlert("Load a TAS file first", Color3.fromRGB(255, 170, 0))
+        return
+    end
+    local lastTime = UnpackFrame(Frames[#Frames]).Time
+    targetTime = math.clamp(tonumber(targetTime) or 0, 0, lastTime)
+    PendingEditTime = targetTime
+    LastEditorTime = targetTime
+    PendingEditCut = true
+    RunStart = tick() - targetTime
+    PauseStart = tick()
+    TimeOffset = 0
+    IsPaused = true
+    ApplyPackedFrameAtTime(Frames, targetTime)
+    if FileTimestampBox then FileTimestampBox.Text = FormatPlaybackTimestamp(targetTime) end
+    if FileTimestampStatus then FileTimestampStatus.Text = "EDIT POINT • " .. FormatPlaybackTimestamp(targetTime) .. " • resume to cut" end
+    SendAlert("Edit point: " .. FormatPlaybackTimestamp(targetTime) .. " — resume to cut the future", Color3.fromRGB(0, 255, 255))
+end
+
+CutFramesAfterTime = function(targetTime)
+    if #Frames == 0 then return end
+    targetTime = math.max(0, tonumber(targetTime) or 0)
+    local kept = {}
+    for i = 1, #Frames do
+        local frame = UnpackFrame(Frames[i])
+        if frame.Time <= targetTime then kept[#kept + 1] = Frames[i] else break end
+    end
+    if #kept == 0 then kept[1] = Frames[1] end
+    Frames = kept
+    local last = UnpackFrame(Frames[#Frames])
+    if math.abs(last.Time - targetTime) > 0.0005 then
+        local character = LocalPlayer.Character
+        local root = character and character:FindFirstChild("HumanoidRootPart")
+        if root then Frames[#Frames + 1] = PackFrame(targetTime, root.Velocity, GetPlayerCFrame(), workspace.CurrentCamera.CFrame, CurrentAnim) end
+    end
+end
+
+BuildFileTimestampControl = function(anchor)
+    if FileTimestampBox or not UI_Elements then return end
+    anchor = anchor or (UI_Elements.Buttons and UI_Elements.Buttons.LoadRun)
+    local host = anchor and anchor.Parent or (UI_Elements.FileList and UI_Elements.FileList.Parent)
+    if not host then return end
+    local panel = Instance.new("Frame")
+    panel.Name = "FileTimestampControl"
+    panel.Size = anchor and anchor.Size or UDim2.new(1, -10, 0, 34)
+    panel.Position = anchor and UDim2.new(anchor.Position.X.Scale, anchor.Position.X.Offset, anchor.Position.Y.Scale, anchor.Position.Y.Offset - 39) or UDim2.new(0, 5, 1, -39)
+    panel.BackgroundColor3 = Color3.fromRGB(28, 28, 35)
+    panel.BackgroundTransparency = 0.05
+    panel.BorderSizePixel = 0
+    panel.ZIndex = 30
+    panel.Parent = host
+    Instance.new("UICorner", panel).CornerRadius = UDim.new(0, 6)
+    local box = Instance.new("TextBox")
+    box.Name = "Timestamp"
+    box.Size = UDim2.new(0.72, -5, 1, -8)
+    box.Position = UDim2.new(0, 4, 0, 4)
+    box.BackgroundColor3 = Color3.fromRGB(40, 40, 48)
+    box.BorderSizePixel = 0
+    box.ClearTextOnFocus = false
+    box.Font = Enum.Font.Gotham
+    box.Text = "0:00.000"
+    box.TextColor3 = Color3.new(1, 1, 1)
+    box.TextSize = 11
+    box.PlaceholderText = "Timestamp"
+    box.ZIndex = 31
+    box.Parent = panel
+    Instance.new("UICorner", box).CornerRadius = UDim.new(0, 5)
+    local go = Instance.new("TextButton")
+    go.Name = "Go"
+    go.Size = UDim2.new(0.28, -5, 1, -8)
+    go.Position = UDim2.new(0.72, 0, 0, 4)
+    go.BackgroundColor3 = Color3.fromRGB(45, 45, 55)
+    go.BorderSizePixel = 0
+    go.Font = Enum.Font.GothamBold
+    go.Text = "GO"
+    go.TextColor3 = Color3.new(1, 1, 1)
+    go.TextSize = 11
+    go.ZIndex = 31
+    go.Parent = panel
+    Instance.new("UICorner", go).CornerRadius = UDim.new(0, 5)
+    FileTimestampBox = box
+    local function goToTimestamp()
+        local t = ParsePlaybackTimestamp(box.Text)
+        if not t then
+            SendAlert("Invalid timestamp — use 12.345 or 0:12.345", Color3.fromRGB(255, 0, 0))
+            return
+        end
+        SeekLoadedTAS(t)
+    end
+    go.Activated:Connect(goToTimestamp)
+    box.FocusLost:Connect(function(enterPressed) if enterPressed then goToTimestamp() end end)
+end
+
+-- // TAS SPEED EDITOR //
+-- Edits only the currently loaded TAS. A transformed copy is written to the selected
+-- file only when the user presses SAVE SPEED EDIT; the previous file is kept as .backup.
+BuildSpeedEditControl = function(anchor)
+    if not UI_Elements or UI_Elements.ScreenGui == nil then return end
+    if UI_Elements.ScreenGui:FindFirstChild("SpeedEditControl", true) then return end
+    anchor = anchor or (UI_Elements.Buttons and UI_Elements.Buttons.LoadRun)
+    local host = anchor and anchor.Parent or (UI_Elements.FileList and UI_Elements.FileList.Parent)
+    if not host then return end
+
+    local panel = Instance.new("Frame")
+    panel.Name = "SpeedEditControl"
+    panel.Size = UDim2.new(anchor and anchor.Size.X.Scale or 1, anchor and anchor.Size.X.Offset or -10, 0, 106)
+    panel.Position = anchor and UDim2.new(anchor.Position.X.Scale, anchor.Position.X.Offset, anchor.Position.Y.Scale, anchor.Position.Y.Offset - 146) or UDim2.new(0, 5, 1, -146)
+    panel.BackgroundColor3 = Color3.fromRGB(28, 28, 35)
+    panel.BackgroundTransparency = 0.03
+    panel.BorderSizePixel = 0
+    panel.ZIndex = 40
+    panel.Parent = host
+    Instance.new("UICorner", panel).CornerRadius = UDim.new(0, 6)
+
+    local function makeBox(name, placeholder, size, position, defaultText)
+        local box = Instance.new("TextBox")
+        box.Name = name
+        box.Size = size
+        box.Position = position
+        box.BackgroundColor3 = Color3.fromRGB(42, 42, 51)
+        box.BorderSizePixel = 0
+        box.ClearTextOnFocus = false
+        box.Font = Enum.Font.Gotham
+        box.Text = defaultText or ""
+        box.PlaceholderText = placeholder
+        box.TextColor3 = Color3.new(1, 1, 1)
+        box.PlaceholderColor3 = Color3.fromRGB(170, 170, 180)
+        box.TextSize = 10
+        box.ZIndex = 41
+        box.Parent = panel
+        Instance.new("UICorner", box).CornerRadius = UDim.new(0, 4)
+        return box
+    end
+
+    local scopeButton = Instance.new("TextButton")
+    scopeButton.Name = "Scope"
+    scopeButton.Size = UDim2.new(0.52, -6, 0, 23)
+    scopeButton.Position = UDim2.new(0, 4, 0, 4)
+    scopeButton.BackgroundColor3 = Color3.fromRGB(48, 48, 60)
+    scopeButton.BorderSizePixel = 0
+    scopeButton.Font = Enum.Font.GothamBold
+    scopeButton.Text = "Scope: WHOLE TAS"
+    scopeButton.TextColor3 = Color3.new(1, 1, 1)
+    scopeButton.TextSize = 10
+    scopeButton.ZIndex = 41
+    scopeButton.Parent = panel
+    Instance.new("UICorner", scopeButton).CornerRadius = UDim.new(0, 4)
+
+    local speedBox = makeBox("SpeedMultiplier", "Speed x", UDim2.new(0.48, -6, 0, 23), UDim2.new(0.52, 2, 0, 4), "2")
+    local fromBox = makeBox("StartTime", "From (seconds)", UDim2.new(0.5, -6, 0, 22), UDim2.new(0, 4, 0, 31), "20")
+    local toBox = makeBox("EndTime", "To (seconds)", UDim2.new(0.5, -6, 0, 22), UDim2.new(0.5, 2, 0, 31), "30")
+
+    local saveButton = Instance.new("TextButton")
+    saveButton.Name = "SaveSpeedEdit"
+    saveButton.Size = UDim2.new(1, -8, 0, 25)
+    saveButton.Position = UDim2.new(0, 4, 0, 57)
+    saveButton.BackgroundColor3 = Color3.fromRGB(0, 115, 82)
+    saveButton.BorderSizePixel = 0
+    saveButton.Font = Enum.Font.GothamBold
+    saveButton.Text = "SAVE SPEED EDIT"
+    saveButton.TextColor3 = Color3.new(1, 1, 1)
+    saveButton.TextSize = 11
+    saveButton.ZIndex = 41
+    saveButton.Parent = panel
+    Instance.new("UICorner", saveButton).CornerRadius = UDim.new(0, 4)
+
+    local note = Instance.new("TextLabel")
+    note.Name = "Note"
+    note.BackgroundTransparency = 1
+    note.Size = UDim2.new(1, -8, 0, 15)
+    note.Position = UDim2.new(0, 4, 0, 84)
+    note.Font = Enum.Font.Gotham
+    note.Text = "Writes to loaded TAS; backup kept"
+    note.TextColor3 = Color3.fromRGB(190, 190, 200)
+    note.TextSize = 9
+    note.TextXAlignment = Enum.TextXAlignment.Center
+    note.ZIndex = 41
+    note.Parent = panel
+
+    local scope = "WHOLE"
+    scopeButton.Activated:Connect(function()
+        scope = (scope == "WHOLE") and "RANGE" or "WHOLE"
+        scopeButton.Text = "Scope: " .. (scope == "WHOLE" and "WHOLE TAS" or "TIME RANGE")
+        scopeButton.BackgroundColor3 = scope == "WHOLE" and Color3.fromRGB(48, 48, 60) or Color3.fromRGB(65, 75, 105)
+    end)
+
+    local function addBoundaryFrame(packed, targetTime)
+        -- Keep an exact sample at each range boundary so only the requested interval
+        -- changes speed, even when no original frame lands exactly on that timestamp.
+        local pos = 1
+        while pos <= #packed do
+            local current = UnpackFrame(packed[pos])
+            if math.abs(current.Time - targetTime) <= 0.0005 then return packed end
+            if current.Time > targetTime then break end
+            pos += 1
+        end
+        if pos <= 1 or pos > #packed then return packed end
+        local a = UnpackFrame(packed[pos - 1])
+        local b = UnpackFrame(packed[pos])
+        local span = b.Time - a.Time
+        local alpha = span > 0 and math.clamp((targetTime - a.Time) / span, 0, 1) or 0
+        local cf = a.CFrame:Lerp(b.CFrame, alpha)
+        local cam = a.CameraCFrame:Lerp(b.CameraCFrame, alpha)
+        local vel = a.Velocity:Lerp(b.Velocity, alpha)
+        local anim = a.Animation or {"walk", 0.1}
+        table.insert(packed, pos, PackFrame(targetTime, vel, cf, cam, anim))
+        return packed
+    end
+
+    local function transformTime(t, firstTime, startTime, endTime, multiplier)
+        if scope == "WHOLE" then
+            return firstTime + (t - firstTime) / multiplier
+        elseif t < startTime then
+            return t
+        elseif t <= endTime then
+            return startTime + (t - startTime) / multiplier
+        else
+            return t - (endTime - startTime) * (1 - 1 / multiplier)
+        end
+    end
+
+    saveButton.Activated:Connect(function()
+        if not LoadedFileMode or #Frames < 2 or LoadedEditorFilename == "" then
+            SendAlert("Select a TAS file and click Load before speed editing", Color3.fromRGB(255, 170, 0))
+            return
+        end
+        if not IsPaused then
+            SendAlert("Pause the loaded TAS before saving a speed edit", Color3.fromRGB(255, 170, 0))
+            return
+        end
+        if SpeedEditSavedThisLoad then
+            SendAlert("Speed edit already saved — reload the TAS before applying another edit", Color3.fromRGB(255, 170, 0))
+            return
+        end
+
+        local multiplier = tonumber(speedBox.Text)
+        if not multiplier or multiplier <= 1 or multiplier > 20 then
+            SendAlert("Speed must be greater than 1x and no more than 20x", Color3.fromRGB(255, 0, 0))
+            return
+        end
+
+        local sourceFrames = table.clone(Frames)
+        local firstTime = UnpackFrame(sourceFrames[1]).Time
+        local lastTime = UnpackFrame(sourceFrames[#sourceFrames]).Time
+        local startTime, endTime
+        if scope == "RANGE" then
+            startTime = ParsePlaybackTimestamp(fromBox.Text)
+            endTime = ParsePlaybackTimestamp(toBox.Text)
+            if not startTime or not endTime or startTime < firstTime or endTime > lastTime or endTime <= startTime then
+                SendAlert("Invalid range: use start/end within " .. FormatPlaybackTimestamp(firstTime) .. "–" .. FormatPlaybackTimestamp(lastTime), Color3.fromRGB(255, 0, 0))
+                return
+            end
+            addBoundaryFrame(sourceFrames, startTime)
+            addBoundaryFrame(sourceFrames, endTime)
+        else
+            startTime, endTime = firstTime, lastTime
+        end
+
+        local transformed = {}
+        for i = 1, #sourceFrames do
+            local frame = UnpackFrame(sourceFrames[i])
+            local originalTime = frame.Time
+            local inSpeedSegment = scope == "WHOLE" or (originalTime >= startTime and originalTime <= endTime)
+            local newTime = transformTime(originalTime, firstTime, startTime, endTime, multiplier)
+            local velocity = frame.Velocity
+            local animation = frame.Animation or {"walk", 0.1}
+            if inSpeedSegment then
+                velocity = velocity * multiplier
+                animation = {animation[1], (tonumber(animation[2]) or 0.1) * multiplier}
+            else
+                animation = {animation[1], tonumber(animation[2]) or 0.1}
+            end
+            transformed[#transformed + 1] = PackFrame(newTime, velocity, frame.CFrame, frame.CameraCFrame, animation)
+        end
+
+        local targetFilename = LoadedEditorFilename
+        local targetPath = "Flood-GUI/TAS FILES/" .. targetFilename
+        local oldFrames = Frames
+        local oldSavestates = Savestates
+        local oldTime = LastEditorTime
+        local ok, saveError = pcall(function()
+            if not isfolder("Flood-GUI/TAS FILES") then makefolder("Flood-GUI/TAS FILES") end
+            if readfile and isfile and isfile(targetPath) then
+                local oldContents = readfile(targetPath)
+                -- The .backup suffix intentionally keeps this outside the .json file list.
+                writefile(targetPath .. ".backup", oldContents)
+            end
+            Frames = transformed
+            Savestates = {}
+            local outputData = CompileTASData()
+            local encoded = HttpService:JSONEncode(outputData)
+            writefile(targetPath, encoded)
+            PreloadedTASData = outputData
+            PreloadedTASFilename = targetFilename
+        end)
+        if not ok then
+            Frames = oldFrames
+            Savestates = oldSavestates
+            LastEditorTime = oldTime
+            SendAlert("Speed edit was not saved: " .. tostring(saveError), Color3.fromRGB(255, 0, 0))
+            return
+        end
+
+        SpeedEditSavedThisLoad = true
+        LastEditorTime = transformTime(oldTime, firstTime, startTime, endTime, multiplier)
+        PendingEditTime = transformTime(PendingEditTime, firstTime, startTime, endTime, multiplier)
+        -- Keep the current playback clock stable while paused. If a seek is waiting
+        -- to cut the future, TogglePause will reset RunStart from PendingEditTime.
+        if not PendingEditCut then RunStart = PauseStart - LastEditorTime end
+        if UI_Elements and UI_Elements.SaveBox then UI_Elements.SaveBox.Text = targetFilename:gsub("%.json$", "") end
+        if FileTimestampBox then FileTimestampBox.Text = FormatPlaybackTimestamp(LastEditorTime) end
+        if FileTimestampStatus then FileTimestampStatus.Text = "SAVED SPEED EDIT • " .. FormatPlaybackTimestamp(UnpackFrame(Frames[#Frames]).Time) end
+        note.Text = "Saved " .. targetFilename .. " (backup kept)"
+        SendAlert(string.format("Saved %.2fx speed edit to %s", multiplier, targetFilename), Color3.fromRGB(0, 255, 100))
+    end)
+end
+
 local function HookAnimations(character)
     character = character or LocalPlayer.Character
     if not character then return false end
@@ -858,6 +1392,17 @@ end
 
 -- // CLEANUP //
 function ResetToNormal()
+    PlaybackState.Active = false
+    PlaybackState.Paused = false
+    PlaybackState.Data = nil
+    IsViewingTAS = false
+    LoadedFileMode = false
+    LoadedEditorFilename = ""
+    SpeedEditSavedThisLoad = false
+    PendingEditCut = false
+    PendingEditTime = 0
+    PreloadedTASData = nil
+    PreloadedTASFilename = ""
     getgenv().TAS_Active = false
     getgenv().IsSwimming = false
     getgenv().PauseSpoofing = false
@@ -931,6 +1476,19 @@ function TogglePause()
             if StatusLabel then StatusLabel.Text = "PAUSED"; StatusLabel.TextColor3 = Color3.fromRGB(255, 200, 80) end
             SendAlert("Paused", Color3.fromRGB(255, 255, 0))
         else
+            -- Resuming after a timestamp seek cuts the old future timeline.
+            if LoadedFileMode and PendingEditCut then
+                CutFramesAfterTime(PendingEditTime)
+                RunStart = tick() - PendingEditTime
+                LastEditorTime = PendingEditTime
+                TimeOffset = 0
+                PauseStart = tick()
+                PendingEditCut = false
+                if FileTimestampStatus then
+                    FileTimestampStatus.Text = "EDITING • " .. FormatPlaybackTimestamp(PendingEditTime)
+                end
+                SendAlert("Future frames cut — recording from " .. FormatPlaybackTimestamp(PendingEditTime), Color3.fromRGB(0, 255, 255))
+            end
             Root.Anchored = false; Root.Velocity = SavedVelocity; TimeOffset = TimeOffset + tick() - PauseStart
             if StatusLabel then StatusLabel.Text = "PLAYING"; StatusLabel.TextColor3 = Color3.fromRGB(255, 255, 255) end
             RecordAccumulator = 0
@@ -1126,17 +1684,44 @@ local function SetupMap()
 
     SendAlert("Scanning for Buttons...", Color3.fromRGB(255, 170, 0))
     
+    -- Button scan (re-run during the loop, because some maps only reveal / swap in
+    -- later buttons after earlier ones are pressed).
     local Buttons = {}
-    for i, MapObject in pairs(LiveMap:GetDescendants()) do
-        if isRandomString(MapObject.Name) and MapObject:IsA("Model") then
-            local Hitbox
-            for i, Candidate in pairs(MapObject:GetChildren()) do
-                if Candidate:IsA("BasePart") and tostring(Candidate.BrickColor) ~= "Medium stone grey" then Hitbox = Candidate; break end
+    local SeenHitboxes = {}
+    local function ScanButtons()
+        for _, obj in ipairs(LiveMap:GetDescendants()) do
+            local holder, hb
+            if obj:IsA("Model") and isRandomString(obj.Name) and obj.Name ~= "NPC" and not obj:FindFirstAncestor("_Rescue") then
+                holder = obj
+                for _, c in ipairs(obj:GetChildren()) do
+                    if c:IsA("BasePart") and tostring(c.BrickColor) ~= "Medium stone grey" then hb = c; break end
+                end
+            elseif obj.Name == "ButtonIcon" then
+                local p = obj.Parent and obj.Parent.Parent
+                if p and p:IsA("BasePart") then holder, hb = p, p
+                elseif p and p:IsA("Model") then holder, hb = p, p:FindFirstChildOfClass("BasePart") end
             end
-            if Hitbox and isRandomString(Hitbox.Name) then Hitbox.Name = "Hitbox"; table.insert(Buttons, MapObject) end
+            if holder then
+                -- The part that really owns the TouchInterest is the true hitbox
+                local ti = holder:FindFirstChild("TouchInterest", true)
+                if ti and ti.Parent and ti.Parent:IsA("BasePart") then hb = ti.Parent end
+            end
+            if holder and hb and not SeenHitboxes[hb] then
+                SeenHitboxes[hb] = true
+                GetUUID(hb)
+                table.insert(Buttons, {Holder = holder, Hitbox = hb})
+            end
         end
     end
-    
+    ScanButtons()
+    local LastRescan = os.clock()
+    local ScanDirty = false
+    -- New parts / GUIs appearing (e.g. a button revealed after another is pressed) mark a rescan
+    local DirtyCon = LiveMap.DescendantAdded:Connect(function(d)
+        if d:IsA("BasePart") or d:IsA("Model") or d:IsA("BillboardGui") or d:IsA("TouchTransmitter") then ScanDirty = true end
+    end)
+    table.insert(Recorders, DirtyCon)
+
     SendAlert("Autofarm: Found " .. #Buttons .. " Buttons", Color3.fromRGB(0, 255, 0))
     SendAlert("Commencing Auto Farm", Color3.fromRGB(255, 170, 0))
 
@@ -1159,10 +1744,13 @@ local function SetupMap()
         
         local FailedScan = true; Root.Anchored = true
         
-        for i, Button in pairs(Buttons) do
-            local ButtonHitbox = Button:FindFirstChild("Hitbox")
-            if ButtonHitbox then
-                local TouchFound = Button:FindFirstChild("TouchInterest", true)
+        -- Rescan only when something new appeared (no more 2x/sec full-map scans = no lag spikes)
+        if ScanDirty and os.clock() - LastRescan > 0.05 then ScanDirty = false; LastRescan = os.clock(); ScanButtons() end
+
+        for i, Entry in ipairs(Buttons) do
+            local Button, ButtonHitbox = Entry.Holder, Entry.Hitbox
+            if Button.Parent and ButtonHitbox.Parent then
+                local TouchFound = Button:FindFirstChild("TouchInterest", true) or ButtonHitbox:FindFirstChildWhichIsA("TouchTransmitter")
                 local GuiFound = Button:FindFirstChildWhichIsA("BillboardGui", true)
                 
                 if (TouchFound and GuiFound) then
@@ -1175,7 +1763,6 @@ local function SetupMap()
                             local Ping = LocalPlayer:GetNetworkPing()
                             ButtonPressTimings[uuid] = (os.clock() - StartTime) + Ping
                         end
-                        if LastTargetButton ~= nil then task.wait(0.1) end
                         LastTargetButton = Button
                     else
                         local uuid = GetUUID(ButtonHitbox)
@@ -1188,11 +1775,27 @@ local function SetupMap()
                     Root.CFrame = CFrame.new(ButtonHitbox.Position)
                     Root.Velocity = Vector3.new(0, 0, 0)
                     Hum:ChangeState(Enum.HumanoidStateType.Jumping)
-                    task.wait(0.255/15)
+                    -- Dwell just long enough for the server to register the touch:
+                    -- one-way ping + a small margin (override with getgenv().AutofarmDwell)
+                    local dwell = getgenv().AutofarmDwell
+                    if not dwell then
+                        local okp, pg = pcall(function() return LocalPlayer:GetNetworkPing() end)
+                        dwell = math.clamp((okp and pg or 0.05) + 0.02, 0.03, 0.12)
+                    end
+                    local t0 = os.clock()
+                    repeat
+                        RunService.Heartbeat:Wait()
+                        Root.CFrame = CFrame.new(ButtonHitbox.Position)
+                    until os.clock() - t0 >= dwell
+                        or not Button.Parent
+                        or not Button:FindFirstChildWhichIsA("BillboardGui", true)
                 end
             end
         end
         
+        if FailedScan and os.clock() - LastRescan > 0.25 then
+            LastRescan = os.clock(); ScanButtons()
+        end
         if FailedScan then
             -- Ensure player isn't anchored to prevent hanging on last button serverside.
             Root.Anchored = false
@@ -1232,6 +1835,13 @@ local function SetupMap()
     for _, desc in ipairs(ClonedMap:GetDescendants()) do
         local id = desc:GetAttribute("TAS_UUID")
         if id then MapUUIDs[id] = desc end
+    end
+    local RecordedHitboxSet = {}
+    for _, u in ipairs(RecordedButtonSequence) do RecordedHitboxSet[u] = true end
+    for u in pairs(ButtonPressTimings) do RecordedHitboxSet[u] = true end
+    for u in pairs(RecordedHitboxSet) do
+        local p = MapUUIDs[u]
+        if p then p:SetAttribute("TAS_IsButton", true) end
     end
     
     for _, Event in ipairs(MapEvents) do Event.Instance = MapUUIDs[Event.UUID] end
@@ -1372,6 +1982,21 @@ local function SetupMap()
                         SendAlert("Character reset: systems rebound, savestate restore failed", Color3.fromRGB(255, 170, 0))
                     end
                 end
+            elseif ClonedMap and ClonedMap.Parent and LoadedFileMode and #Frames > 0 then
+                IsPaused = true
+                local targetTime = math.max(0, LastEditorTime or PendingEditTime or 0)
+                RunStart = tick() - targetTime
+                PauseStart = tick()
+                TimeOffset = 0
+                task.wait(0.1)
+                if bindGeneration == CharacterBindGeneration and c == LocalPlayer.Character then
+                    local ok = pcall(function() ApplyPackedFrameAtTime(Frames, targetTime) end)
+                    if ok then
+                        SendAlert("Character reset: loaded TAS timeline restored", Color3.fromRGB(0, 255, 255))
+                    else
+                        SendAlert("Character reset: timeline restore failed", Color3.fromRGB(255, 170, 0))
+                    end
+                end
             end
         end)
     end))
@@ -1443,6 +2068,11 @@ local function SetupMap()
             else
                 local hp = obj:FindFirstChild("Hitbox") 
                 if not hp then
+                    for _, c in ipairs(obj:GetDescendants()) do
+                        if c:IsA("BasePart") and c:GetAttribute("TAS_IsButton") then hp = c; break end
+                    end
+                end
+                if not hp then
                     for _, c in ipairs(obj:GetChildren()) do
                         if c:IsA("BasePart") and tostring(c.BrickColor) ~= "Medium stone grey" then hp = c; break end
                     end
@@ -1483,6 +2113,39 @@ local function SetupMap()
                     end))
                 end
             end
+        end
+    end
+    -- Safety net: any recorded button hitbox that the name-based scan above missed
+    for _, obj in ipairs(ClonedMap:GetDescendants()) do
+        if obj:IsA("BasePart") and obj:GetAttribute("TAS_IsButton") and not CheckedButtonParts[obj] then
+            CheckedButtonParts[obj] = true
+            table.insert(TotalButtons, obj)
+            local hp = obj
+            local sel = Instance.new("SelectionBox", hp)
+            sel.Adornee = hp; sel.Color3 = Color3.fromRGB(255, 140, 0); sel.SurfaceTransparency = 0.8
+            hp.CanTouch = true
+            local uuid = GetUUID(hp)
+            local order = table.find(RecordedButtonSequence, uuid) or 999
+            local recTime = ButtonPressTimings[uuid]
+            local bData = {IsPressed = false, PressTime = nil, SelectionBox = sel, Order = order, RecordedTime = recTime}
+            ButtonRegistry[hp] = bData; OrderedButtonRegistry[order] = bData
+            AddConnection(hp.Touched:Connect(function(hit)
+                if hit.Parent == LocalPlayer.Character and not bData.IsPressed then
+                    if not RunStart then return end
+                    if bData.Order and bData.Order > 1 then
+                        local prevBtn = OrderedButtonRegistry[bData.Order - 1]
+                        if prevBtn and not prevBtn.IsPressed then SendAlert("WRONG ORDER! Press Button #" .. (bData.Order - 1) .. " first!", Color3.fromRGB(255, 0, 0)); return end
+                    end
+                    local RealTime = tick() - RunStart - TimeOffset
+                    if AutoResetEnv and bData.RecordedTime then
+                        PreviewOffset = bData.RecordedTime - RealTime
+                        SendAlert("Synced to " .. string.format("%.2fs", bData.RecordedTime), Color3.fromRGB(0, 255, 255))
+                    end
+                    bData.IsPressed = true; bData.PressTime = RealTime; bData.TruePressTime = RealTime
+                    sel.Color3 = Color3.fromRGB(0, 255, 0)
+                    SendAlert("Button " .. (order ~= 999 and "#"..order or "") .. " Pressed!", Color3.fromRGB(0, 255, 0))
+                end
+            end))
         end
     end
     SendAlert("Map Ready & Linked", Color3.fromRGB(0, 255, 0))
@@ -1935,6 +2598,7 @@ local HBCon = RunService.Heartbeat:Connect(function(dt)
 
     local RealTime = 0
     if not IsPaused then RealTime = tick() - RunStart - TimeOffset else RealTime = (PauseStart or tick()) - RunStart - TimeOffset end
+    if LoadedFileMode then LastEditorTime = math.max(0, RealTime) end
     
     local VisualTime = RealTime + PreviewOffset; if VisualTime < 0 then VisualTime = 0 end
     
@@ -2029,8 +2693,6 @@ local InputCon = UserInputService.InputBegan:Connect(function(input, gpe)
             SendAlert("Visuals Resynced", Color3.fromRGB(0, 255, 255))
         elseif k == Keybinds.ViewTAS then
             if not IsViewingTAS then PlaybackTAS(CompileTASData()) end
-        elseif k == Keybinds.LoadRun then
-            if SelectedFileToLoad ~= "" then pcall(function() PlaybackTAS(HttpService:JSONDecode(readfile("Flood-GUI/TAS FILES/" .. SelectedFileToLoad))) end) end
         elseif k == Keybinds.AutoSwimToggler then -- Added Keybind Handler (T)
             getgenv().EnableAutoSwim = not getgenv().EnableAutoSwim
             if UI_Elements and UI_Elements.Buttons and UI_Elements.Buttons.AutoSwim then
